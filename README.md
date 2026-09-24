@@ -2,8 +2,6 @@
 
 > Control your [Pi](https://pi.dev) coding-agent session from Discord.
 
-![pi-discord-remote demo](demo.gif)
-
 `/rc start` connects the extension and creates a Discord text channel on first use. Later connections reuse the saved channel. Messages in the channel are injected into Pi as prompts. `/rc disconnect` pauses message handling but preserves the channel; `/rc stop` deletes it.
 
 ## Install
