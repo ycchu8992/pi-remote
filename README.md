@@ -8,13 +8,17 @@
 
 ## Install
 
-Requires [Pi](https://pi.dev) and Node.js 18 or newer. From a terminal, install the extension with Pi's package manager:
+The npm package is not published yet. For now, install from the source repository. Requires [Pi](https://pi.dev), Git, and Node.js 18 or newer:
 
 ```bash
-pi install npm:pi-discord-remote
+git clone https://github.com/ycchu8992/pi-discord-remote.git
+cd pi-discord-remote
+npm ci
+npm run build
+pi install "$PWD"
 ```
 
-Restart Pi to load the extension, then run `/rc setup` in Pi to configure your Discord bot. See [Bot setup](#bot-setup) for the required Discord permissions and [Usage](#usage) for commands.
+Restart Pi to load the extension, then run `/rc setup` in Pi to configure your Discord bot. See [Bot setup](#bot-setup) for the required Discord permissions and [Usage](#usage) for commands. To update later, pull the latest source, rerun `npm ci && npm run build`, and restart Pi.
 
 ## Bot setup
 
