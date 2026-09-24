@@ -4,13 +4,17 @@
 
 ![pi-discord-remote demo](demo.gif)
 
-Each time you run `/pi-discord-remote start`, the extension automatically creates a **new Discord text channel** named after your current project + date (e.g. `kaleidoscope-may09`). Messages sent in that channel are injected into Pi as user prompts; Pi's responses are posted back. When you stop, the channel is deleted — keeping your server clean within Discord's channel limit.
+`/rc start` connects the extension and creates a Discord text channel on first use. Later connections reuse the saved channel. Messages in the channel are injected into Pi as prompts. `/rc disconnect` pauses message handling but preserves the channel; `/rc stop` deletes it.
 
 ## Install
+
+Requires [Pi](https://pi.dev) and Node.js 18 or newer. From a terminal, install the extension with Pi's package manager:
 
 ```bash
 pi install npm:pi-discord-remote
 ```
+
+Restart Pi to load the extension, then run `/rc setup` in Pi to configure your Discord bot. See [Bot setup](#bot-setup) for the required Discord permissions and [Usage](#usage) for commands.
 
 ## Bot setup
 
@@ -25,11 +29,12 @@ pi install npm:pi-discord-remote
 ## Usage
 
 ```
-/pi-discord-remote setup        — configure token, server ID, optional category
-/pi-discord-remote start        — create channel + connect
-/pi-discord-remote stop         — delete channel + disconnect
-/pi-discord-remote status       — show connection state
-/pi-discord-remote open-config  — edit config JSON in Pi's editor
+/rc setup        — configure token, server ID, optional category
+/rc start        — connect or resume (reuses saved channel)
+/rc disconnect   — pause while preserving channel
+/rc stop         — delete channel + disconnect
+/rc status       — show connection state
+/rc open-config  — edit config JSON in Pi's editor
 ```
 
 ### Setup prompts
@@ -65,22 +70,21 @@ For CI or headless setups, you can skip `setup` entirely and set these env vars:
 | `reactions` | boolean | `true` | React with ⏳ while processing |
 | `toolResponses` | boolean | `false` | Also post tool outputs/results alongside tool-call labels (truncated to ≤400 chars) |
 
-Edit config with `/pi-discord-remote open-config`.
+Edit config with `/rc open-config`.
 
 ## How it works
 
 The extension loads silently on Pi startup — no channel is created until you explicitly run the command.
 
-- **`/pi-discord-remote start`** — bot logs in, creates a text channel named `<project>-<mon><dd>-<HHMM>`, and starts listening there only
+- **`/rc start`** — bot logs in, reuses its saved channel (or creates one named `<project>-<mon><dd>-<HHMM>`), and listens there only
 - **Incoming message** — injected as a user prompt into the active Pi session; bot reacts ⏳ while Pi works, then posts the full response back
 - **Tool calls** — each tool invocation is labeled (🔧 bash, 📄 read, ✏️ edit, etc.) with a detail line; if `toolResponses` is on, results follow as ↩️/❌ code blocks
-- **`/pi-discord-remote stop`** (or Pi exit) — channel is deleted, bot disconnects
+- **`/rc disconnect`** — pause remote messages without deleting the channel; **`/rc stop`** (or Pi exit) deletes the channel and disconnects.
+- Discord `/rc ...` controls this integration. Core Pi commands with public API mappings are exposed directly as Discord slash commands: `/model` (with live model autocomplete), `/thinking`, `/name`, `/session`, `/new`, `/compact`, `/abort`, `/fork`, `/clone`, `/tree`, and `/reload`. Other extension, skill, and prompt commands are available through `/pi` and discovered dynamically from `pi.getCommands()`. Commands that require TUI-only UI (for example `/settings` or `/login`) are not mapped.
 
-### Optional image skill tool
+### Sending files and artifacts
 
-Image forwarding is **not automatic** in `pi-discord-remote`.
-
-If you want to send an image, use the explicit `discord_send_image` tool (opt-in):
+Forwarding is opt-in. Use `discord_send_file` to upload a local artifact/file (or URL/base64) to the active channel. For image-specific forwarding, the tool accepts the same path/URL/base64 inputs.
 - optional `channelId` (recommended for deterministic targeting)
 - source by local `path`
 - or source by `url`
@@ -88,7 +92,7 @@ If you want to send an image, use the explicit `discord_send_image` tool (opt-in
 
 Exactly one source should be provided per call. If omitted, the tool falls back to the latest `agent_browser` image artifact path.
 
-`/pi-discord-remote status` now shows the active **Channel ID** so you can pass it directly to `discord_send_image`.
+`/rc status` shows the active **Channel ID** for explicit targeting.
 
 The tool returns explicit send errors (for example `unknown_channel:<id>` or timeout/HTTP errors) instead of silently forwarding images.
 

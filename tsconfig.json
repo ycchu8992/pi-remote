@@ -16,5 +16,5 @@
     "isolatedModules": true
   },
   "include": ["extensions/**/*.ts"],
-  "exclude": ["node_modules", "dist"]
+  "exclude": ["node_modules", "dist", "extensions/**/__tests__/**"]
 }
