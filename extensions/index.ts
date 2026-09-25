@@ -294,6 +294,15 @@ export default function (pi: ExtensionAPI) {
 
   // ── Collect assistant output ──────────────────────────────────────────────
 
+  // Mirror terminal prompts to the same channel as remote turns. Extension-origin
+  // prompts are already present in Discord and must not be echoed back.
+  pi.on("input", async (event) => {
+    if (event.source !== "interactive" || !client?.isReady() || remotelyPaused || !runtime.activeChannelId) return;
+    pendingReplyChannelId = runtime.activeChannelId;
+    pendingReplyUserId = null;
+    for (const chunk of splitMessage(`⌨️ Terminal: ${event.text}`)) await sendToActiveChannel(chunk);
+  });
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   pi.on("agent_start", async (_event: any) => {
     agentBusy = true;
