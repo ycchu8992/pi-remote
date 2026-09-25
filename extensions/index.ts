@@ -1293,20 +1293,33 @@ export default function (pi: ExtensionAPI) {
             break;
           }
           case "new": {
-            const outcome = await ctx.newSession();
+            const outcome = await ctx.newSession({
+              withSession: async (newCtx: any) => {
+                newCtx.ui.notify("Started a new Pi session.", "info");
+              },
+            });
             result = outcome.cancelled ? "New session cancelled." : "✅ Started a new Pi session.";
             break;
           }
           case "fork": {
             if (!args || !ctx.sessionManager.getEntry(args)) throw new Error("Pass a valid session entry ID to fork from.");
-            const outcome = await ctx.fork(args);
+            const outcome = await ctx.fork(args, {
+              withSession: async (newCtx: any) => {
+                newCtx.ui.notify(`Forked session at ${args}.`, "info");
+              },
+            });
             result = outcome.cancelled ? "Fork cancelled." : `✅ Forked session at ${args}.`;
             break;
           }
           case "clone": {
             const leafId = ctx.sessionManager.getLeafId();
             if (!leafId) throw new Error("Cannot clone an empty session.");
-            const outcome = await ctx.fork(leafId, { position: "at" });
+            const outcome = await ctx.fork(leafId, {
+              position: "at",
+              withSession: async (newCtx: any) => {
+                newCtx.ui.notify("Cloned the current session position.", "info");
+              },
+            });
             result = outcome.cancelled ? "Clone cancelled." : "✅ Cloned the current session position.";
             break;
           }
@@ -1318,8 +1331,8 @@ export default function (pi: ExtensionAPI) {
           }
           case "reload":
             await ctx.reload();
-            result = "✅ Pi extensions and session resources reloaded.";
-            break;
+            // ctx is invalid after reload; do not access it again.
+            return;
           default:
             throw new Error(`No direct Pi API mapping for /${request.command}.`);
         }
