@@ -370,6 +370,17 @@ export default function (pi: ExtensionAPI) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const content = event.message.content as Array<any>;
 
+    // Provider failures can end without a text response. Surface them immediately,
+    // rather than silently clearing the pending reply at agent_end.
+    if (event.message.role === "assistant" && event.message.stopReason === "error") {
+      const error = String(event.message.errorMessage ?? "Unknown provider error");
+      if (/context.length|context.window|token.limit|too.many.tokens|maximum.*tokens|prompt.*too.long/i.test(error)) {
+        await sendToActiveChannel(`❌ Context/token limit reached: ${error.slice(0, 1200)}`);
+      } else {
+        await sendToActiveChannel(`❌ Model error: ${error.slice(0, 1200)}`);
+      }
+    }
+
     // Collect text from assistant messages
     if (event.message.role === "assistant") {
       const text = content
