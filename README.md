@@ -1,4 +1,4 @@
-# pi-discord-remote
+# pi-remote
 
 > Control your [Pi](https://pi.dev) coding-agent session from Discord.
 
