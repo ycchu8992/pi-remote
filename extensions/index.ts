@@ -27,14 +27,20 @@ import {
   REST,
   Routes,
   SlashCommandBuilder,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   GatewayIntentBits,
   Partials,
   type Message,
   type TextChannel,
 } from "discord.js";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdtemp, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { basename } from "node:path";
+import { basename, join } from "node:path";
+import { tmpdir } from "node:os";
 
 import { loadConfig, saveConfig, CONFIG_FILE, defaultConfigTemplate } from "./config.js";
 import type { Config } from "./config.js";
@@ -743,7 +749,37 @@ export default function (pi: ExtensionAPI) {
       pendingReplyChannelId = message.channelId;
       pendingReplyUserId = message.author.id;
       collectedAssistantText = [];
-      pi.sendUserMessage(message.content);
+      try {
+        const parts: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
+        const files: string[] = [];
+        for (const attachment of message.attachments.values()) {
+          const url = new URL(attachment.url);
+          if (url.protocol !== "https:" || !["cdn.discordapp.com", "media.discordapp.net"].includes(url.hostname)) {
+            throw new Error("Attachment URL is not a Discord CDN URL.");
+          }
+          if (attachment.size > 20 * 1024 * 1024) throw new Error(`Attachment ${attachment.name} exceeds 20 MB.`);
+          const response = await withTimeout(fetch(url), 20_000, "download_attachment");
+          if (!response.ok) throw new Error(`Could not download ${attachment.name}: HTTP ${response.status}`);
+          const bytes = Buffer.from(await response.arrayBuffer());
+          if (bytes.length > 20 * 1024 * 1024) throw new Error(`Attachment ${attachment.name} exceeds 20 MB.`);
+          const mimeType = attachment.contentType?.split(";")[0] ?? "";
+          if (["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mimeType)) {
+            parts.push({ type: "image", data: bytes.toString("base64"), mimeType });
+          } else {
+            const dir = await mkdtemp(join(tmpdir(), "pi-discord-attachment-"));
+            const path = join(dir, basename(attachment.name ?? "attachment"));
+            await writeFile(path, bytes);
+            files.push(`${attachment.name}: ${path}`);
+          }
+        }
+        const prompt = [message.content, files.length ? `Attached files (local paths; use the read tool to inspect):\n${files.join("\n")}` : ""].filter(Boolean).join("\n\n");
+        parts.unshift({ type: "text", text: prompt || "Please inspect the attached image(s)." });
+        pi.sendUserMessage(parts);
+      } catch (err: any) {
+        pendingReplyChannelId = null;
+        pendingReplyUserId = null;
+        await message.reply(`❌ Attachment failed: ${String(err?.message ?? err)}`).catch(() => {});
+      }
     };
   }
 
