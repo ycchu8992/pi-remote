@@ -1,13 +1,13 @@
 /**
- * Config management for pi-discord-remote.
- * Config is persisted to ~/.pi/agent/pi-discord-remote/config.json.
+ * Config management for pi-remote.
+ * Config is persisted to ~/.pi/agent/pi-remote/config.json.
  */
 
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-export const CONFIG_DIR = join(homedir(), ".pi", "agent", "pi-discord-remote");
+export const CONFIG_DIR = join(homedir(), ".pi", "agent", "pi-remote");
 export const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 
 export interface Config {

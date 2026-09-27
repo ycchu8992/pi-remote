@@ -1,10 +1,10 @@
 /**
  * pi-discord-remote — control this Pi session from Discord
  *
- * Each /rc start connects to the saved channel or creates a fresh text channel named after the
- * current working directory + date (e.g. "kaleidoscope-may09").  On stop
- * (or session shutdown) the channel is deleted to stay within Discord's
- * per-server channel limit.
+ * /rc enable connects to the saved channel or creates a fresh text channel named after the
+ * current working directory + date (e.g. "kaleidoscope-may09"). /rc disable
+ * pauses remote messages without deleting the channel. On session shutdown the channel
+ * is deleted to stay within Discord's per-server channel limit.
  *
  * Bot permissions required:
  *   • Read/Send Messages, Add Reactions  (existing)
@@ -12,11 +12,9 @@
  *
  * Commands:
  *   /rc setup       — interactive setup (token, guildId, categoryId, allowed users)
- *   /rc start       — connect or resume
- *   /rc disconnect  — pause while preserving channel
- *   /rc stop        — delete channel + disconnect
- *   /rc status      — show connection state
- *   /rc open-config — edit config.json in the editor
+ *   /rc enable  — connect or resume
+ *   /rc disable — pause while preserving channel and clear the UI status
+ *   /rc status  — show connection state
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -42,7 +40,7 @@ import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { loadConfig, saveConfig, CONFIG_FILE, defaultConfigTemplate } from "./config.js";
+import { loadConfig, saveConfig, CONFIG_FILE } from "./config.js";
 import type { Config } from "./config.js";
 import {
   makeChannelName,
@@ -482,11 +480,11 @@ export default function (pi: ExtensionAPI) {
         `[pi-discord-remote] Max reconnect attempts (${RECONNECT_MAX_ATTEMPTS}) reached. Giving up.`,
       );
       reconnectFailed = true;
-      connectNotify?.(
-        `❌ Discord reconnect failed after ${RECONNECT_MAX_ATTEMPTS} attempts. Run /rc start to retry.`,
+      if (!remotelyPaused) connectNotify?.(
+        `❌ Discord reconnect failed after ${RECONNECT_MAX_ATTEMPTS} attempts. Run /rc enable to retry.`,
         "error",
       );
-      connectSetStatus?.("pi-discord-remote", "❌ Discord: reconnect failed");
+      if (!remotelyPaused) connectSetStatus?.("pi-discord-remote", "❌ Discord: reconnect failed");
       return;
     }
 
@@ -498,7 +496,7 @@ export default function (pi: ExtensionAPI) {
     console.log(
       `[pi-discord-remote] Reconnect attempt ${reconnectAttempt}/${RECONNECT_MAX_ATTEMPTS} in ${Math.round(delay)}ms`,
     );
-    connectSetStatus?.("pi-discord-remote", `🔄 Discord: reconnecting (${reconnectAttempt}/${RECONNECT_MAX_ATTEMPTS})…`);
+    if (!remotelyPaused) connectSetStatus?.("pi-discord-remote", `🔄 Discord: reconnecting (${reconnectAttempt}/${RECONNECT_MAX_ATTEMPTS})…`);
 
     reconnectTimer = setTimeout(async () => {
       reconnectTimer = null;
@@ -537,13 +535,13 @@ export default function (pi: ExtensionAPI) {
     client.on("interactionCreate", buildInteractionHandler());
     client.on("error", (err) => {
       console.error("[pi-discord-remote] Discord client error:", err);
-      setStatus("pi-discord-remote", "⚠️ Discord: error");
+      if (!remotelyPaused) setStatus("pi-discord-remote", "⚠️ Discord: error");
     });
     const reconnectClient = client;
     reconnectClient.on("shardDisconnect", () => {
       if (isShuttingDown || client !== reconnectClient) return;
       console.error("[pi-discord-remote] Discord WebSocket disconnected during reconnect, retrying…");
-      setStatus("pi-discord-remote", "🔄 Discord: reconnecting…");
+      if (!remotelyPaused) setStatus("pi-discord-remote", "🔄 Discord: reconnecting…");
       scheduleReconnect();
     });
 
@@ -571,8 +569,8 @@ export default function (pi: ExtensionAPI) {
       reconnectFailed = false;
       const channelLabel = runtime.sessionChannelName ?? runtime.activeChannelId ?? "unknown";
       console.log(`[pi-discord-remote] Reconnected successfully → #${channelLabel}`);
-      notify(`✅ Discord reconnected → #${channelLabel}`, "success");
-      setStatus("pi-discord-remote", remotelyPaused ? "⏸️ Discord: paused" : `🔌 Discord: #${channelLabel}`);
+      if (!remotelyPaused) notify(`✅ Discord reconnected → #${channelLabel}`, "success");
+      setStatus("pi-discord-remote", remotelyPaused ? undefined : `🔌 Discord: #${channelLabel}`);
 
       // Post a notice in the channel so the user knows we're back
       if (runtime.activeChannelId) {
@@ -677,18 +675,14 @@ export default function (pi: ExtensionAPI) {
         activeConfig.guildId = interaction.guildId;
         await saveConfig(activeConfig);
         await interaction.reply({ content: "This server is configured. Set bot token and allow-list with `/rc setup` in the Pi terminal.", ephemeral: true });
-      } else if (action === "stop") {
-        await interaction.deferReply({ ephemeral: true });
-        await deleteSessionChannel(() => {});
-        remotelyPaused = true;
-        await interaction.editReply("Session channel deleted. Run /rc start in Pi to create another.");
       } else if (action === "status") {
-        await interaction.reply({ content: `Discord ${client?.isReady() ? "connected" : "disconnected"}; channel: ${runtime.activeChannelId ?? "none"}`, ephemeral: true });
-      } else if (action === "disconnect") {
+        await interaction.reply({ content: `Discord ${remotelyPaused ? "disabled" : client?.isReady() ? "connected" : "disconnected"}; channel: ${runtime.activeChannelId ?? "none"}`, ephemeral: true });
+      } else if (action === "disable") {
         remotelyPaused = true;
         pendingReplyChannelId = null;
-        await interaction.reply({ content: `Paused; channel ${runtime.activeChannelId ?? "(none)"} preserved. Use /rc start to resume.`, ephemeral: true });
-      } else if (action === "start") {
+        connectSetStatus?.("pi-discord-remote", undefined);
+        await interaction.reply({ content: "Remote session disabled; channel preserved.", ephemeral: true });
+      } else if (action === "enable") {
         if (!runtime.activeChannelId && client?.isReady()) {
           try {
             const guild = await client.guilds.fetch(activeConfig.guildId);
@@ -706,20 +700,8 @@ export default function (pi: ExtensionAPI) {
           }
         }
         remotelyPaused = false;
+        connectSetStatus?.("pi-discord-remote", `🔌 Discord: #${runtime.sessionChannelName ?? runtime.activeChannelId ?? "unknown"}`);
         await interaction.reply({ content: `Resumed Pi remote session in <#${runtime.activeChannelId}>.`, ephemeral: true });
-      } else if (action === "prompt") {
-        if (remotelyPaused) { await interaction.reply({ content: "Session is paused; use /rc start first.", ephemeral: true }); return; }
-        const prompt = interaction.options.getString("text", true);
-        if (agentBusy) { await interaction.reply({ content: "⏳ Agent is busy.", ephemeral: true }); return; }
-        if (!runtime.activeChannelId || interaction.channelId !== runtime.activeChannelId) {
-          await interaction.reply({ content: "Use this command in the active session channel.", ephemeral: true }); return;
-        }
-        await interaction.reply({ content: "⏳ Sent to Pi." });
-        pendingReplyChannelId = interaction.channelId;
-        pendingReplyUserId = interaction.user.id;
-        pi.sendUserMessage(prompt);
-      } else {
-        await interaction.reply({ content: "Run /rc start in the Pi terminal to connect.", ephemeral: true });
       }
     };
   }
@@ -806,7 +788,7 @@ export default function (pi: ExtensionAPI) {
         (key, val) => ctx.ui.setStatus(key, val));
       if (client && saved.paused) {
         remotelyPaused = true;
-        ctx.ui.setStatus("pi-discord-remote", "⏸️ Discord: paused");
+        ctx.ui.setStatus("pi-discord-remote", undefined);
       }
     }
   });
@@ -837,7 +819,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Auto-connect removed — user must run /rc start explicitly.
+  // Auto-connect removed — user must run /rc enable explicitly.
 
   // ── Connect + channel-create helper ──────────────────────────────────────
 
@@ -890,14 +872,14 @@ export default function (pi: ExtensionAPI) {
     // ── Reconnection handling (for post-connect disconnects only) ──────
     client.on("error", (err) => {
       console.error("[pi-discord-remote] Discord client error:", err);
-      setStatusFn("pi-discord-remote", "⚠️ Discord: error");
+      if (!remotelyPaused) setStatusFn("pi-discord-remote", "⚠️ Discord: error");
     });
 
     const initialClient = client;
     initialClient.on("shardDisconnect", () => {
       if (isShuttingDown || client !== initialClient) return;
       console.error("[pi-discord-remote] Discord WebSocket disconnected, starting reconnect…");
-      setStatusFn("pi-discord-remote", "🔄 Discord: reconnecting…");
+      if (!remotelyPaused) setStatusFn("pi-discord-remote", "🔄 Discord: reconnecting…");
       scheduleReconnect();
     });
 
@@ -944,11 +926,9 @@ export default function (pi: ExtensionAPI) {
             }),
             new SlashCommandBuilder().setName("rc").setDescription("Control the Pi remote session")
               .addSubcommand(s => s.setName("setup").setDescription("Configure this server"))
-              .addSubcommand(s => s.setName("start").setDescription("Connect to this Pi session"))
-              .addSubcommand(s => s.setName("stop").setDescription("Delete the session channel"))
-              .addSubcommand(s => s.setName("disconnect").setDescription("Disconnect but preserve the channel"))
+              .addSubcommand(s => s.setName("enable").setDescription("Connect to this Pi session"))
+              .addSubcommand(s => s.setName("disable").setDescription("Pause and preserve the channel"))
               .addSubcommand(s => s.setName("status").setDescription("Show connection status"))
-              .addSubcommand(s => s.setName("prompt").setDescription("Send a prompt to Pi").addStringOption(o => o.setName("text").setDescription("Prompt text").setRequired(true)))
               .toJSON(),
           ] });
 
@@ -1497,8 +1477,7 @@ export default function (pi: ExtensionAPI) {
     description: "Control this Pi session from Discord (creates a new channel per session)",
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     handler: async (args: any, ctx: any) => {
-      const parts = (args ?? "").trim().split(/\s+/);
-      const cmd = parts[0] || "help";
+      const cmd = (args ?? "").trim().split(/\s+/)[0];
 
       switch (cmd) {
         // ── setup ─────────────────────────────────────────────────────────
@@ -1547,9 +1526,8 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
-        // ── start ─────────────────────────────────────────────────────────
-        case "connect":
-        case "start": {
+        // ── enable ────────────────────────────────────────────────────────
+        case "enable": {
           activeModelRegistry = ctx.modelRegistry;
           const cfg = await loadConfig();
           if (!cfg) {
@@ -1565,35 +1543,11 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
-        // Disconnect while keeping the Discord channel for a later reconnect.
-        case "disconnect": {
-          if (!client) { ctx.ui.notify("Not connected.", "warning"); return; }
+        // Pause messages while preserving the channel for /rc enable.
+        case "disable": {
           remotelyPaused = true;
           pendingReplyChannelId = null;
-          ctx.ui.setStatus("pi-discord-remote", "⏸️ Discord: paused");
-          ctx.ui.notify(`Paused. Channel ${runtime.activeChannelId ?? "(none)"} was preserved; use /rc start to resume.`, "info");
-          break;
-        }
-
-        // ── stop ──────────────────────────────────────────────────────────
-        case "stop": {
-          if (!client) {
-            ctx.ui.notify("Not connected.", "warning");
-            return;
-          }
-          isShuttingDown = true;
-          clearReconnectTimer();
-          reconnectAttempt = 0;
-          reconnectFailed = false;
-          await deleteSessionChannel((key, val) => ctx.ui.setStatus(key, val));
-          await client.destroy().catch(() => {});
-          client = null;
-          activeConfig = null;
-          runtime.activeChannelId = null;
-          runtime.sessionChannelName = null;
-          connectNotify = null;
-          connectSetStatus = null;
-          ctx.ui.notify("Disconnected from Discord. Channel deleted.", "info");
+          ctx.ui.setStatus("pi-discord-remote", undefined);
           break;
         }
 
@@ -1617,47 +1571,17 @@ export default function (pi: ExtensionAPI) {
             );
           } else if (reconnectFailed) {
             ctx.ui.notify(
-              `❌ Reconnect failed after ${RECONNECT_MAX_ATTEMPTS} attempts. Run /rc start to retry.`,
+              `❌ Reconnect failed after ${RECONNECT_MAX_ATTEMPTS} attempts. Run /rc enable to retry.`,
               "error",
             );
           } else {
-            ctx.ui.notify("❌ Not connected. Run /rc start.", "info");
+            ctx.ui.notify("❌ Not connected. Run /rc enable.", "info");
           }
           break;
         }
 
-        // ── open-config ───────────────────────────────────────────────────
-        case "open-config": {
-          const raw = existsSync(CONFIG_FILE)
-            ? await readFile(CONFIG_FILE, "utf-8")
-            : defaultConfigTemplate();
-
-          const edited = await ctx.ui.editor("pi-discord-remote config.json", raw);
-          if (!edited) return;
-
-          try {
-            const parsed = JSON.parse(edited) as Config;
-            await saveConfig(parsed);
-            ctx.ui.notify("Config saved.", "success");
-          } catch {
-            ctx.ui.notify("Invalid JSON — config not saved.", "error");
-          }
-          break;
-        }
-
-        // ── help ──────────────────────────────────────────────────────────
         default: {
-          ctx.ui.notify(
-            [
-              "/rc setup       — configure bot token, guild, category",
-              "/rc start       — connect (reuse prior channel when available)",
-              "/rc disconnect — disconnect but preserve channel",
-              "/rc stop        — delete channel + disconnect",
-              "/rc status      — show connection state",
-              "/rc open-config — edit config JSON",
-            ].join("\n"),
-            "info",
-          );
+          ctx.ui.notify("Unknown /rc command. Use setup, enable, disable, or status.", "error");
         }
       }
     },

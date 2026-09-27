@@ -2,7 +2,7 @@
 
 > Control your [Pi](https://pi.dev) coding-agent session from Discord.
 
-`/rc start` connects the extension and creates a Discord text channel on first use. Later connections reuse the saved channel. Messages in the channel are injected into Pi as prompts. `/rc disconnect` pauses message handling but preserves the channel; `/rc stop` deletes it.
+`/rc enable` connects the extension and creates a Discord text channel on first use. Later connections reuse the saved channel. Messages in the channel are injected into Pi as prompts. `/rc disable` pauses message handling and clears the UI indicator, but preserves the channel.
 
 ## Install
 
@@ -31,12 +31,10 @@ Restart Pi to load the extension, then run `/rc setup` in Pi to configure your D
 ## Usage
 
 ```
-/rc setup        — configure token, server ID, optional category
-/rc start        — connect or resume (reuses saved channel)
-/rc disconnect   — pause while preserving channel
-/rc stop         — delete channel + disconnect
-/rc status       — show connection state
-/rc open-config  — edit config JSON in Pi's editor
+/rc setup    — configure token, server ID, optional category
+/rc enable   — connect or resume (reuses saved channel)
+/rc disable  — pause, preserve channel, clear UI indicator
+/rc status   — show connection state
 ```
 
 ### Setup prompts
@@ -49,7 +47,7 @@ Restart Pi to load the extension, then run `/rc setup` in Pi to configure your D
 | Allowed user IDs | Right-click a user → Copy User ID (leave empty to allow everyone) |
 | Tool responses | Send tool outputs (results/errors) to Discord alongside tool-call labels? (y/n, default: no) |
 
-Config is stored at `~/.pi/agent/pi-discord-remote/config.json`.
+Config is stored at `~/.pi/agent/p-remote/config.json`.
 
 ### Environment variables (alternative to config file)
 
@@ -72,16 +70,16 @@ For CI or headless setups, you can skip `setup` entirely and set these env vars:
 | `reactions` | boolean | `true` | React with ⏳ while processing |
 | `toolResponses` | boolean | `false` | Also post tool outputs/results alongside tool-call labels (truncated to ≤400 chars) |
 
-Edit config with `/rc open-config`.
+To change configuration, run `/rc setup` again or edit `~/.pi/agent/pi-remote/config.json` directly.
 
 ## How it works
 
 The extension loads silently on Pi startup — no channel is created until you explicitly run the command.
 
-- **`/rc start`** — bot logs in, reuses its saved channel (or creates one named `<project>-<mon><dd>-<HHMM>`), and listens there only
+- **`/rc enable`** — bot logs in, reuses its saved channel (or creates one named `<project>-<mon><dd>-<HHMM>`), and listens there only
 - **Incoming message** — injected as a user prompt into the active Pi session; bot reacts ⏳ while Pi works, then posts the full response back
 - **Tool calls** — each tool invocation is labeled (🔧 bash, 📄 read, ✏️ edit, etc.) with a detail line; if `toolResponses` is on, results follow as ↩️/❌ code blocks
-- **`/rc disconnect`** — pause remote messages without deleting the channel; **`/rc stop`** (or Pi exit) deletes the channel and disconnects.
+- **`/rc disable`** — pause remote messages and clear the Pi status indicator without deleting the channel; `/rc enable` resumes it. Pi exit still deletes the channel and disconnects.
 - Discord `/rc ...` controls this integration. Core Pi commands with public API mappings are exposed directly as Discord slash commands: `/model` (with live model autocomplete), `/thinking`, `/name`, `/session`, `/new`, `/compact`, `/abort`, `/fork`, `/clone`, `/tree`, and `/reload`. Other extension, skill, and prompt commands are not available through Discord. Commands that require TUI-only UI (for example `/settings` or `/login`) are not mapped.
 
 ### Sending files and artifacts
