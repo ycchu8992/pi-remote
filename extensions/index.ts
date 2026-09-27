@@ -575,6 +575,38 @@ export default function (pi: ExtensionAPI) {
 
   function buildInteractionHandler() {
     return async (interaction: any) => {
+      if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith("pi-question:")) {
+        if (interaction.channelId !== questionChannelId ||
+          (activeConfig?.allowedUserIds?.length && !activeConfig.allowedUserIds.includes(interaction.user.id))) {
+          await interaction.reply({ content: "You cannot answer this question.", ephemeral: true });
+          return;
+        }
+        const values: string[] = interaction.values ?? [];
+        const value = values[0];
+        if (value === "__other__") {
+          const modal = new ModalBuilder().setCustomId("pi-question-other").setTitle("Custom answer");
+          const input = new TextInputBuilder().setCustomId("answer").setLabel("Your answer").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1000);
+          modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+          await interaction.showModal(modal);
+        } else if (questionResolver) {
+          await interaction.deferUpdate();
+          questionResolver(values.join("\n"));
+        } else {
+          await interaction.reply({ content: "This question is no longer active.", ephemeral: true });
+        }
+        return;
+      }
+      if (interaction.isModalSubmit?.() && interaction.customId === "pi-question-other") {
+        if (interaction.channelId !== questionChannelId ||
+          (activeConfig?.allowedUserIds?.length && !activeConfig.allowedUserIds.includes(interaction.user.id))) {
+          await interaction.reply({ content: "You cannot answer this question.", ephemeral: true });
+          return;
+        }
+        const answer = interaction.fields.getTextInputValue("answer");
+        await interaction.reply({ content: "Custom answer recorded.", ephemeral: true });
+        questionResolver?.(answer);
+        return;
+      }
       if (interaction.isAutocomplete?.() && interaction.commandName === "model") {
         const query = String(interaction.options.getFocused() ?? "").toLowerCase();
         const choices = (activeModelRegistry?.getAvailable?.() ?? [])
@@ -1085,9 +1117,28 @@ export default function (pi: ExtensionAPI) {
           lines.push("> Reply with the number or label, type a custom answer, or type \"chat\" to skip.");
         }
 
-        // Send the question
+        // Discord select menus allow at most 25 options; reserve one for custom input.
+        if (q.options.length > 24) {
+          return {
+            content: [{ type: "text", text: `Question ${qi + 1} has more than 24 options; Discord menus support at most 24 plus Other.` }],
+            details: { answers, cancelled: true, error: "too_many_options" },
+          };
+        }
+        // Use a Discord select menu for structured choices; the final option opens a modal.
         try {
-          await channel.send(lines.join("\n"));
+          const choices = q.options.map((option: any, index: number) => ({
+            label: `${index + 1}. ${option.label}`.slice(0, 100),
+            value: option.label,
+            description: option.description?.slice(0, 100),
+          }));
+          choices.push({ label: "Other — enter a custom answer", value: "__other__", description: "Type an answer not listed above" });
+          const menu = new StringSelectMenuBuilder()
+            .setCustomId(`pi-question:${qi}`)
+            .setPlaceholder(q.multiSelect ? "Choose one or more options" : "Choose an option")
+            .setMinValues(1)
+            .setMaxValues(q.multiSelect ? Math.max(1, choices.length - 1) : 1)
+            .addOptions(choices);
+          await channel.send({ content: lines.join("\n"), components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)] });
         } catch {
           return {
             content: [{ type: "text", text: "Failed to send question to Discord." }],
@@ -1147,7 +1198,7 @@ export default function (pi: ExtensionAPI) {
         // Parse answer
         if (q.multiSelect) {
           // Multi-select: try to parse numbers/labels
-          const parts = trimmed.split(/[,\s]+/).filter(Boolean);
+          const parts = trimmed.split(/[\n,]+/).map((part) => part.trim()).filter(Boolean);
           const selected: string[] = [];
           for (const part of parts) {
             const num = parseInt(part, 10);
