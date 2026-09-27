@@ -22,8 +22,14 @@ export interface Config {
   allowedUserIds?: string[];
   /** React with emoji while processing (default: true) */
   reactions?: boolean;
-  /** Also send tool responses (output/results) after each tool call (default: false) */
-  toolResponses?: boolean;
+  /** 0 = no tool messages; 1 = calls only (default); 2 = calls and results. Booleans support older configs. */
+  toolResponses?: 0 | 1 | 2 | boolean;
+}
+
+export function toolMessageLevel(value: Config["toolResponses"]): 0 | 1 | 2 {
+  if (value === 0) return 0;
+  if (value === 2 || value === true) return 2;
+  return 1; // unset, 1, or legacy false
 }
 
 export async function loadConfig(): Promise<Config | null> {
@@ -42,7 +48,7 @@ export async function loadConfig(): Promise<Config | null> {
         guildId: process.env.DISCORD_GUILD_ID,
         categoryId: process.env.DISCORD_CATEGORY_ID,
         reactions: true,
-        toolResponses: false,
+        toolResponses: 1,
       };
     }
     return null;
@@ -64,8 +70,8 @@ export function defaultConfigTemplate(): string {
         categoryId: "",
         allowedUserIds: [],
         reactions: true,
-        // Set to true to also post tool outputs/results after each tool call
-        toolResponses: false,
+        // 0 = hide calls and results; 1 = calls only; 2 = calls and results
+        toolResponses: 1,
       },
       null,
       2,

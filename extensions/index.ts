@@ -40,7 +40,7 @@ import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { loadConfig, saveConfig, CONFIG_FILE } from "./config.js";
+import { loadConfig, saveConfig, toolMessageLevel, CONFIG_FILE } from "./config.js";
 import type { Config } from "./config.js";
 import {
   makeChannelName,
@@ -341,8 +341,8 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Only send text summaries if toolResponses is enabled
-    if (!activeConfig?.toolResponses) return;
+    // Level 2 includes results; levels 0 and 1 do not.
+    if (toolMessageLevel(activeConfig?.toolResponses) !== 2) return;
 
     // Build a label like "↩️ bash: ..." or "↩️ read: ..."
     const emoji = event.isError ? "❌" : "↩️";
@@ -379,6 +379,7 @@ export default function (pi: ExtensionAPI) {
     if (!pendingReplyChannelId) return;
     // discord_ask_user_question is handled by our tool (formatted output)
     if (event.toolName === "discord_ask_user_question") return;
+    if (toolMessageLevel(activeConfig?.toolResponses) === 0) return;
     await sendToActiveChannel(toolLabel(event.toolName, event.args));
   });
 
@@ -670,38 +671,18 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const action = interaction.options.getSubcommand();
-      if (action === "setup") {
-        if (!interaction.guildId) { await interaction.reply({ content: "Run setup in a server.", ephemeral: true }); return; }
-        activeConfig.guildId = interaction.guildId;
-        await saveConfig(activeConfig);
-        await interaction.reply({ content: "This server is configured. Set bot token and allow-list with `/rc setup` in the Pi terminal.", ephemeral: true });
-      } else if (action === "status") {
+      if (action === "setup" || action === "enable") {
+        // Old guild command registrations may remain cached on clients until Discord refreshes them.
+        await interaction.reply({ content: `/rc ${action} is only available in the Pi terminal.`, ephemeral: true });
+        return;
+      }
+      if (action === "status") {
         await interaction.reply({ content: `Discord ${remotelyPaused ? "disabled" : client?.isReady() ? "connected" : "disconnected"}; channel: ${runtime.activeChannelId ?? "none"}`, ephemeral: true });
       } else if (action === "disable") {
         remotelyPaused = true;
         pendingReplyChannelId = null;
         connectSetStatus?.("pi-remote", undefined);
         await interaction.reply({ content: "Remote session disabled; channel preserved.", ephemeral: true });
-      } else if (action === "enable") {
-        if (!runtime.activeChannelId && client?.isReady()) {
-          try {
-            const guild = await client.guilds.fetch(activeConfig.guildId);
-            const name = makeChannelName(process.cwd());
-            const channel = await guild.channels.create({ name, type: ChannelType.GuildText,
-              ...(activeConfig.categoryId ? { parent: activeConfig.categoryId } : {}),
-              topic: `Pi session — ${process.cwd()}` });
-            runtime.activeChannelId = channel.id;
-            runtime.sessionChannelName = channel.name;
-            activeConfig.channelId = channel.id;
-            await saveConfig(activeConfig);
-          } catch (err: any) {
-            await interaction.reply({ content: `Could not create channel: ${err.message}`, ephemeral: true });
-            return;
-          }
-        }
-        remotelyPaused = false;
-        connectSetStatus?.("pi-remote", `🔌 Discord: #${runtime.sessionChannelName ?? runtime.activeChannelId ?? "unknown"}`);
-        await interaction.reply({ content: `Resumed Pi remote session in <#${runtime.activeChannelId}>.`, ephemeral: true });
       }
     };
   }
@@ -925,8 +906,6 @@ export default function (pi: ExtensionAPI) {
               return command.toJSON();
             }),
             new SlashCommandBuilder().setName("rc").setDescription("Control the Pi remote session")
-              .addSubcommand(s => s.setName("setup").setDescription("Configure this server"))
-              .addSubcommand(s => s.setName("enable").setDescription("Connect to this Pi session"))
               .addSubcommand(s => s.setName("disable").setDescription("Pause and preserve the channel"))
               .addSubcommand(s => s.setName("status").setDescription("Show connection status"))
               .toJSON(),
@@ -1507,10 +1486,16 @@ export default function (pi: ExtensionAPI) {
             : undefined;
 
           const toolResponsesRaw = await ctx.ui.input(
-            "Send tool responses to Discord? (yes/no, default: no):",
-            existing?.toolResponses ? "yes" : "no",
+            "Tool messages (0 = hide all, 1 = calls only, 2 = calls + results):",
+            String(toolMessageLevel(existing?.toolResponses)),
           );
-          const toolResponses = toolResponsesRaw?.trim().toLowerCase() === "yes";
+          if (toolResponsesRaw === undefined) return;
+          const level = toolResponsesRaw.trim();
+          if (level !== "0" && level !== "1" && level !== "2") {
+            ctx.ui.notify("Tool messages must be 0, 1, or 2. Config was not saved.", "error");
+            return;
+          }
+          const toolResponses = Number(level) as 0 | 1 | 2;
 
           const cfg: Config = {
             token,
