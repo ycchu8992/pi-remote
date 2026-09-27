@@ -616,49 +616,7 @@ export default function (pi: ExtensionAPI) {
         await interaction.respond(choices);
         return;
       }
-      if (interaction.isAutocomplete?.() && interaction.commandName === "pi") {
-        const query = String(interaction.options.getFocused() ?? "").toLowerCase();
-        const choices = pi.getCommands()
-          .filter(command => command.name !== "discord-remote-core" && !MAPPED_CORE_COMMANDS.some(mapped => mapped.name === command.name))
-          .filter(command => command.name.toLowerCase().includes(query))
-          .slice(0, 25)
-          .map(command => ({ name: `/${command.name}${command.description ? ` — ${command.description}` : ""}`.slice(0, 100), value: command.name }));
-        await interaction.respond(choices);
-        return;
-      }
       if (!interaction.isChatInputCommand?.() || !activeConfig) return;
-      if (interaction.commandName === "pi") {
-        if (activeConfig.allowedUserIds?.length && !activeConfig.allowedUserIds.includes(interaction.user.id)) {
-          await interaction.reply({ content: "❌ You are not on the allow-list.", ephemeral: true });
-          return;
-        }
-        if (remotelyPaused || interaction.channelId !== runtime.activeChannelId) {
-          await interaction.reply({ content: "Use `/pi` in the active session channel while connected.", ephemeral: true });
-          return;
-        }
-        const commandName = interaction.options.getString("command", true);
-        const args = interaction.options.getString("args") ?? "";
-        const isDynamic = !MAPPED_CORE_COMMANDS.some(command => command.name === commandName) &&
-          pi.getCommands().some(command => command.name === commandName);
-        if (!isDynamic) {
-          await interaction.reply({ content: `Unknown or unsupported Pi command: /${commandName}. Try autocomplete.`, ephemeral: true });
-          return;
-        }
-        if (agentBusy && commandName !== "abort") {
-          await interaction.reply({ content: "⏳ Pi is processing. Only /pi abort can run right now.", ephemeral: true });
-          return;
-        }
-        await interaction.reply({ content: `Running Pi command /${commandName}${args ? ` ${args}` : ""}…` });
-        pendingReplyChannelId = interaction.channelId;
-        pendingReplyUserId = interaction.user.id;
-        const commandText = `/${commandName}${args ? ` ${args}` : ""}`;
-        // Current Pi runtimes support extension-command dispatch through this option.
-        (pi.sendUserMessage as (text: string, options?: { expandPromptTemplates?: boolean }) => void)(
-          commandText,
-          { expandPromptTemplates: true },
-        );
-        return;
-      }
       if (MAPPED_CORE_COMMANDS.some(command => command.name === interaction.commandName)) {
         if (activeConfig.allowedUserIds?.length && !activeConfig.allowedUserIds.includes(interaction.user.id)) {
           await interaction.reply({ content: "❌ You are not on the allow-list.", ephemeral: true });
@@ -924,9 +882,6 @@ export default function (pi: ExtensionAPI) {
           await saveConfig(cfg);
           const rest = new REST({ version: "10" }).setToken(cfg.token);
           await rest.put(Routes.applicationGuildCommands(c.user.id, cfg.guildId), { body: [
-            new SlashCommandBuilder().setName("pi").setDescription("Run any available Pi slash command")
-              .addStringOption(o => o.setName("command").setDescription("Pi slash command (autocomplete) ").setRequired(true).setAutocomplete(true))
-              .addStringOption(o => o.setName("args").setDescription("Arguments for the selected command")),
             ...MAPPED_CORE_COMMANDS.map(({ name, description }) => {
               const command = new SlashCommandBuilder().setName(name).setDescription(description);
               if (name === "model") command.addStringOption(o => o.setName("model").setDescription("Choose a configured model").setRequired(true).setAutocomplete(true));
@@ -1341,7 +1296,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Bridge the built-ins that Pi exposes through stable ExtensionCommandContext APIs.
-  // This command is invoked internally by the Discord /pi router, not shown in its autocomplete.
+  // Invoked internally by the mapped Discord core slash commands.
   pi.registerCommand("discord-remote-core", {
     description: "Internal Discord bridge for mapped Pi core commands",
     handler: async (encoded: string, ctx: any) => {

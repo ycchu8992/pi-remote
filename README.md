@@ -82,7 +82,7 @@ The extension loads silently on Pi startup — no channel is created until you e
 - **Incoming message** — injected as a user prompt into the active Pi session; bot reacts ⏳ while Pi works, then posts the full response back
 - **Tool calls** — each tool invocation is labeled (🔧 bash, 📄 read, ✏️ edit, etc.) with a detail line; if `toolResponses` is on, results follow as ↩️/❌ code blocks
 - **`/rc disconnect`** — pause remote messages without deleting the channel; **`/rc stop`** (or Pi exit) deletes the channel and disconnects.
-- Discord `/rc ...` controls this integration. Core Pi commands with public API mappings are exposed directly as Discord slash commands: `/model` (with live model autocomplete), `/thinking`, `/name`, `/session`, `/new`, `/compact`, `/abort`, `/fork`, `/clone`, `/tree`, and `/reload`. Other extension, skill, and prompt commands are available through `/pi` and discovered dynamically from `pi.getCommands()`. Commands that require TUI-only UI (for example `/settings` or `/login`) are not mapped.
+- Discord `/rc ...` controls this integration. Core Pi commands with public API mappings are exposed directly as Discord slash commands: `/model` (with live model autocomplete), `/thinking`, `/name`, `/session`, `/new`, `/compact`, `/abort`, `/fork`, `/clone`, `/tree`, and `/reload`. Other extension, skill, and prompt commands are not available through Discord. Commands that require TUI-only UI (for example `/settings` or `/login`) are not mapped.
 
 ### Sending files and artifacts
 
