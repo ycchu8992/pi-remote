@@ -9,24 +9,21 @@
     "discord",
     "remote-control"
   ],
-  "author": "Chuan Bai",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/t2o2/pi-discord-remote.git"
+    "url": "git+https://github.com/ycchu8992/pi-discord-remote.git"
   },
-  "homepage": "https://github.com/t2o2/pi-discord-remote#readme",
+  "homepage": "https://github.com/ycchu8992/pi-discord-remote#readme",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
-    "dist/",
-    "demo.gif"
+    "dist/"
   ],
   "pi": {
     "extensions": [
       "./dist"
-    ],
-    "image": "https://raw.githubusercontent.com/t2o2/pi-discord-remote/main/assets/banner.jpeg"
+    ]
   },
   "scripts": {
     "build": "tsc",

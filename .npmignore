@@ -1,2 +1,0 @@
-# Only dist/ is published (controlled by package.json "files" field).
-# No extra npm-specific exclusions needed.

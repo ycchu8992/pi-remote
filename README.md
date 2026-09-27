@@ -9,8 +9,8 @@
 The npm package is not published yet. For now, install from the source repository. Requires [Pi](https://pi.dev), Git, and Node.js 18 or newer:
 
 ```bash
-git clone https://github.com/ycchu8992/pi-remote.git
-cd pi-remote
+git clone https://github.com/ycchu8992/pi-discord-remote.git
+cd pi-discord-remote
 npm ci
 npm run build
 pi install "$PWD"
