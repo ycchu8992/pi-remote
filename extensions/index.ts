@@ -797,7 +797,7 @@ export default function (pi: ExtensionAPI) {
   // Keep Pi's model catalogue available for Discord slash autocomplete.
   pi.on("session_start", async (event: any, ctx: any) => {
     activeModelRegistry = ctx.modelRegistry;
-    if (event.reason !== "reload") return;
+    if (!["reload", "new", "resume", "fork"].includes(event.reason)) return;
     const saved = reloadSlot[reloadKey];
     delete reloadSlot[reloadKey];
     if (saved) {
@@ -814,9 +814,6 @@ export default function (pi: ExtensionAPI) {
   // ── Session cleanup ───────────────────────────────────────────────────────
 
   pi.on("session_shutdown", async (event: any) => {
-    // These are session replacements, not process shutdowns. Keep the Discord
-    // gateway and remote channel alive while Pi swaps the active session.
-    if (["new", "resume", "fork"].includes(event?.reason)) return;
     // Reject any pending question so tool execution doesn't hang
     if (questionRejecter) {
       questionRejecter(new Error("Session shut down"));
@@ -824,12 +821,15 @@ export default function (pi: ExtensionAPI) {
     clearQuestionState();
     clearReconnectTimer();
     isShuttingDown = true;
-    if (event?.reason === "reload" && client && activeConfig) {
+    const replacing = ["reload", "new", "resume", "fork"].includes(event?.reason);
+    if (replacing && client && activeConfig) {
       reloadSlot[reloadKey] = { config: activeConfig, cwd: process.cwd(), paused: remotelyPaused };
     }
     if (client) {
-      if (event?.reason !== "reload") await deleteSessionChannel((_k, _v) => {});
-      await client.destroy().catch(() => {});
+      if (!replacing) await deleteSessionChannel((_k, _v) => {});
+      const oldClient = client;
+      client = null;
+      await oldClient.destroy().catch(() => {});
       client = null;
       activeConfig = null;
       runtime.activeChannelId = null;
@@ -1360,6 +1360,22 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const args = request.args?.trim() ?? "";
+      const replyChannelId = pendingReplyChannelId;
+      const replyUserId = pendingReplyUserId;
+      const replyToken = activeConfig?.token;
+      // The command's pi/ctx become stale after session replacement. Reply via
+      // Discord REST, not the old runtime's client or UI callback.
+      const replyAfterReplacement = async (text: string) => {
+        if (replyChannelId && replyToken) {
+          const content = `${replyUserId ? `<@${replyUserId}> ` : ""}${text}`;
+          try {
+            const sent = await sendMessageViaDiscordRest({ channelId: replyChannelId, token: replyToken, content });
+            if (!sent.ok) console.error("[pi-discord-remote] Replacement reply failed:", sent.error);
+          } catch (err) {
+            console.error("[pi-discord-remote] Replacement reply failed:", err);
+          }
+        }
+      };
       let result: string;
       try {
         switch (request.command) {
@@ -1413,7 +1429,11 @@ export default function (pi: ExtensionAPI) {
                 newCtx.ui.notify("Started a new Pi session.", "info");
               },
             });
-            result = outcome.cancelled ? "New session cancelled." : "✅ Started a new Pi session.";
+            if (!outcome.cancelled) {
+              await replyAfterReplacement("✅ Started a new Pi session.");
+              return;
+            }
+            result = "New session cancelled.";
             break;
           }
           case "fork": {
@@ -1423,7 +1443,11 @@ export default function (pi: ExtensionAPI) {
                 newCtx.ui.notify(`Forked session at ${args}.`, "info");
               },
             });
-            result = outcome.cancelled ? "Fork cancelled." : `✅ Forked session at ${args}.`;
+            if (!outcome.cancelled) {
+              await replyAfterReplacement(`✅ Forked session at ${args}.`);
+              return;
+            }
+            result = "Fork cancelled.";
             break;
           }
           case "clone": {
@@ -1435,7 +1459,11 @@ export default function (pi: ExtensionAPI) {
                 newCtx.ui.notify("Cloned the current session position.", "info");
               },
             });
-            result = outcome.cancelled ? "Clone cancelled." : "✅ Cloned the current session position.";
+            if (!outcome.cancelled) {
+              await replyAfterReplacement("✅ Cloned the current session position.");
+              return;
+            }
+            result = "Clone cancelled.";
             break;
           }
           case "tree": {
