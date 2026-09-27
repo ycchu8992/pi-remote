@@ -137,15 +137,19 @@ export default function (pi: ExtensionAPI) {
 
   // ── Shared send helpers ──────────────────────────────────────────────────
 
-  async function sendToActiveChannel(text: string): Promise<void> {
-    if (!client || !pendingReplyChannelId) return;
+  async function sendToChannel(channelId: string, text: string): Promise<void> {
+    if (!client) return;
     try {
-      const channel = (await client.channels.fetch(pendingReplyChannelId)) as TextChannel | null;
+      const channel = (await client.channels.fetch(channelId)) as TextChannel | null;
       if (!channel?.isTextBased()) return;
       await (channel as TextChannel).send(text);
     } catch (err) {
       console.error("[pi-remote] Failed to send message:", err);
     }
+  }
+
+  async function sendToActiveChannel(text: string): Promise<void> {
+    if (pendingReplyChannelId) await sendToChannel(pendingReplyChannelId, text);
   }
 
   function getTargetChannelId(overrideChannelId?: string): string | null {
@@ -385,21 +389,21 @@ export default function (pi: ExtensionAPI) {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   pi.on("message_end", async (event: any) => {
+    // Model errors may have no assistant text or pending reply (e.g. a terminal-initiated run).
+    // Mirror them to the session channel regardless of the tool-message verbosity setting.
+    if (event.message.role === "assistant" && event.message.stopReason === "error" && !remotelyPaused) {
+      const channelId = pendingReplyChannelId ?? runtime.activeChannelId;
+      if (channelId) {
+        const error = String(event.message.errorMessage ?? "Unknown provider error");
+        const label = /context.length|context.window|token.limit|too.many.tokens|maximum.*tokens|prompt.*too.long/i.test(error)
+          ? "Context/token limit reached" : "Model error";
+        await sendToChannel(channelId, `❌ ${label}: ${error.slice(0, 1200)}`);
+      }
+    }
     if (!pendingReplyChannelId) return;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const content = event.message.content as Array<any>;
-
-    // Provider failures can end without a text response. Surface them immediately,
-    // rather than silently clearing the pending reply at agent_end.
-    if (event.message.role === "assistant" && event.message.stopReason === "error") {
-      const error = String(event.message.errorMessage ?? "Unknown provider error");
-      if (/context.length|context.window|token.limit|too.many.tokens|maximum.*tokens|prompt.*too.long/i.test(error)) {
-        await sendToActiveChannel(`❌ Context/token limit reached: ${error.slice(0, 1200)}`);
-      } else {
-        await sendToActiveChannel(`❌ Model error: ${error.slice(0, 1200)}`);
-      }
-    }
 
     // Collect text from assistant messages
     if (event.message.role === "assistant") {
@@ -1059,30 +1063,8 @@ export default function (pi: ExtensionAPI) {
       for (let qi = 0; qi < params.questions.length; qi++) {
         const q = params.questions[qi];
 
-        // Format question for Discord
-        const lines: string[] = [];
-        lines.push(`## ${q.header}: ${q.question}`);
-        lines.push("");
-
-        if (q.multiSelect) {
-          lines.push("*(Multi-select — reply with numbers/labels separated by commas)*");
-          lines.push("");
-        }
-
-        for (let oi = 0; oi < q.options.length; oi++) {
-          const opt = q.options[oi];
-          lines.push(`${oi + 1}. **${opt.label}** — ${opt.description}`);
-          if (opt.preview) {
-            lines.push(`\`\`\`\n${opt.preview}\n\`\`\``);
-          }
-        }
-
-        lines.push("");
-        if (q.multiSelect) {
-          lines.push("> Reply with numbers/labels (e.g. \"1,3\") or type \"chat\" to skip.");
-        } else {
-          lines.push("> Reply with the number or label, type a custom answer, or type \"chat\" to skip.");
-        }
+        // Show the question once; choices and descriptions live only in the select menu.
+        const questionText = `## ${q.header}: ${q.question}`;
 
         // Discord select menus allow at most 25 options; reserve one for custom input.
         if (q.options.length > 24) {
@@ -1105,7 +1087,7 @@ export default function (pi: ExtensionAPI) {
             .setMinValues(1)
             .setMaxValues(q.multiSelect ? Math.max(1, choices.length - 1) : 1)
             .addOptions(choices);
-          await channel.send({ content: lines.join("\n"), components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)] });
+          await channel.send({ content: questionText, components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)] });
         } catch {
           return {
             content: [{ type: "text", text: "Failed to send question to Discord." }],
