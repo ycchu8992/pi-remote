@@ -39,6 +39,7 @@ import { readFile, mkdtemp, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 
 import { loadConfig, saveConfig, toolMessageLevel, CONFIG_FILE } from "./config.js";
 import type { Config } from "./config.js";
@@ -66,7 +67,7 @@ const MAPPED_CORE_COMMANDS = [
   { name: "name", description: "Set the session display name" },
   { name: "session", description: "Show current session information" },
   { name: "new", description: "Start a new session" },
-  { name: "fork", description: "Fork from a session entry ID" },
+  { name: "fork", description: "Choose a user message to fork from" },
   { name: "clone", description: "Clone the current session position" },
   { name: "tree", description: "Navigate to a session entry ID" },
   { name: "reload", description: "Reload extensions and session resources" },
@@ -93,6 +94,31 @@ export default function (pi: ExtensionAPI) {
   let activeConfig: Config | null = null;
   const runtime: RuntimeState = { activeChannelId: null, sessionChannelName: null };
   let activeModelRegistry: any = null;
+  let activeSessionManager: any = null;
+  let pendingSource: { messageId: string; channelId: string; entryCount: number; text: string } | null = null;
+  const discordEntryType = "pi-remote-discord-source";
+  type ForkMenu = { userId: string; channelId: string; sessionId: string; entries: Array<{ id: string; text: string }>; page: number; created: number };
+  const forkMenus = new Map<string, ForkMenu>();
+  const FORK_PAGE_SIZE = 22;
+
+  function forkMenuView(menu: ForkMenu, token: string) {
+    const pages = Math.ceil(menu.entries.length / FORK_PAGE_SIZE);
+    const entries = menu.entries.slice(menu.page * FORK_PAGE_SIZE, (menu.page + 1) * FORK_PAGE_SIZE);
+    const options = entries.map((entry, index) => ({
+      label: `${menu.page * FORK_PAGE_SIZE + index + 1}. ${entry.text.replace(/\s+/g, " ").slice(0, 85)}`.slice(0, 100),
+      value: entry.id,
+      description: `Entry ${entry.id}`.slice(0, 100),
+    }));
+    if (menu.page > 0) options.push({ label: "⬅️ Previous page", value: "__prev__", description: "Older messages" });
+    if (menu.page + 1 < pages) options.push({ label: "➡️ Next page", value: "__next__", description: "More messages" });
+    options.push({ label: "Cancel", value: "__cancel__", description: "Do not fork" });
+    return {
+      content: `Choose a user message to fork from (page ${menu.page + 1}/${pages}). Fork creates a new session from before that message.`,
+      components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder().setCustomId(`pi-fork:${token}`).setPlaceholder("Select a message").addOptions(options),
+      )],
+    };
+  }
 
   let agentBusy = false;
   let pendingReplyChannelId: string | null = null;
@@ -137,12 +163,12 @@ export default function (pi: ExtensionAPI) {
 
   // ── Shared send helpers ──────────────────────────────────────────────────
 
-  async function sendToChannel(channelId: string, text: string): Promise<void> {
+  async function sendToChannel(channelId: string, text: string): Promise<string | undefined> {
     if (!client) return;
     try {
       const channel = (await client.channels.fetch(channelId)) as TextChannel | null;
       if (!channel?.isTextBased()) return;
-      await (channel as TextChannel).send(text);
+      return (await (channel as TextChannel).send(text)).id;
     } catch (err) {
       console.error("[pi-remote] Failed to send message:", err);
     }
@@ -306,6 +332,51 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // Locate the exact Discord message, never silently attach a fork to an ambiguous match.
+  async function findForkSource(entryId: string): Promise<Message> {
+    if (!client || !runtime.activeChannelId || !activeSessionManager) throw new Error("Discord is not connected.");
+    const mappings = activeSessionManager.getEntries().filter((entry: any) =>
+      entry.type === "custom" && entry.customType === discordEntryType && entry.data?.entryId === entryId);
+    const mapping = mappings.at(-1)?.data;
+    if (mapping) {
+      const channel = await client.channels.fetch(mapping.channelId);
+      if (!channel?.isTextBased() || !('messages' in channel)) throw new Error("Original Discord channel is unavailable.");
+      return channel.messages.fetch(mapping.messageId);
+    }
+    const entry = activeSessionManager.getEntry(entryId);
+    if (entry?.type !== "message" || entry.message.role !== "user") throw new Error("Selected entry is not a user message.");
+    const content = entry.message.content;
+    const text = typeof content === "string" ? content : content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
+    const channel = await client.channels.fetch(runtime.activeChannelId);
+    if (!channel?.isTextBased() || !('messages' in channel)) throw new Error("Active Discord channel is unavailable.");
+    let before: string | undefined;
+    let match: Message | undefined;
+    // Old sessions predate source mapping; only match an unambiguous message in this channel.
+    for (let page = 0; page < 20; page++) {
+      const batch = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+      if (!batch.size) {
+        if (match) return match;
+        break;
+      }
+      for (const message of batch.values()) {
+        const matches = message.author.id === client.user?.id
+          ? message.content === `> ⌨️ Terminal: ${text}`
+          : !message.author.bot && (!activeConfig?.allowedUserIds?.length || activeConfig.allowedUserIds.includes(message.author.id)) && message.content === text;
+        if (matches) {
+          if (match) throw new Error("Several Discord messages match this entry; cannot safely choose one.");
+          match = message;
+        }
+      }
+      before = batch.last()?.id;
+      if (batch.size < 100) {
+        if (!match) break;
+        return match;
+      }
+    }
+    if (match) throw new Error("History exceeds 2,000 messages; cannot verify the match is unique.");
+    throw new Error("Could not identify the original Discord message (older history or attachment-only message).");
+  }
+
   // ── Collect assistant output ──────────────────────────────────────────────
 
   // Mirror terminal prompts to the same channel as remote turns. Extension-origin
@@ -314,7 +385,13 @@ export default function (pi: ExtensionAPI) {
     if (event.source !== "interactive" || !client?.isReady() || remotelyPaused || !runtime.activeChannelId) return;
     pendingReplyChannelId = runtime.activeChannelId;
     pendingReplyUserId = null;
-    for (const chunk of splitMessage(`> ⌨️ Terminal: ${event.text}`)) await sendToActiveChannel(chunk);
+    let firstMessageId: string | undefined;
+    for (const chunk of splitMessage(`> ⌨️ Terminal: ${event.text}`)) {
+      const id = await sendToChannel(runtime.activeChannelId, chunk);
+      firstMessageId ??= id;
+    }
+    if (firstMessageId) pendingSource = { messageId: firstMessageId, channelId: runtime.activeChannelId,
+      entryCount: activeSessionManager?.getEntries().length ?? 0, text: event.text };
   });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -418,6 +495,16 @@ export default function (pi: ExtensionAPI) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   pi.on("agent_end", async (_event: any) => {
     agentBusy = false;
+    if (pendingSource && activeSessionManager) {
+      const source = pendingSource;
+      pendingSource = null;
+      const entry = activeSessionManager.getEntries().slice(source.entryCount).find((item: any) =>
+        item.type === "message" && item.message.role === "user" &&
+        (typeof item.message.content === "string" ? item.message.content :
+          item.message.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("")) === source.text,
+      );
+      if (entry) pi.appendEntry(discordEntryType, { entryId: entry.id, messageId: source.messageId, channelId: source.channelId });
+    }
 
     if (!pendingReplyChannelId || !client) {
       pendingReplyChannelId = null;
@@ -457,7 +544,8 @@ export default function (pi: ExtensionAPI) {
     if (!client || !runtime.activeChannelId) return;
     try {
       const channel = (await client.channels.fetch(runtime.activeChannelId)) as TextChannel | null;
-      if (channel) await channel.delete("Pi session ended");
+      // Keep discussion threads and their parent channels so old forks remain readable.
+      if (channel && !channel.isThread()) await channel.delete("Pi session ended");
     } catch (err) {
       console.error("[pi-remote] Failed to delete channel:", err);
     }
@@ -599,6 +687,42 @@ export default function (pi: ExtensionAPI) {
 
   function buildInteractionHandler() {
     return async (interaction: any) => {
+      if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith("pi-fork:")) {
+        const token = interaction.customId.slice("pi-fork:".length);
+        const menu = forkMenus.get(token);
+        if (!menu || menu.userId !== interaction.user.id || menu.channelId !== interaction.channelId ||
+          (activeConfig?.allowedUserIds?.length && !activeConfig.allowedUserIds.includes(interaction.user.id))) {
+          await interaction.reply({ content: "This fork menu is unavailable to you.", ephemeral: true });
+          return;
+        }
+        if (Date.now() - menu.created > 10 * 60_000 || remotelyPaused ||
+          menu.channelId !== runtime.activeChannelId || menu.sessionId !== activeSessionManager?.getSessionId()) {
+          forkMenus.delete(token);
+          await interaction.update({ content: "This fork menu has expired. Run /fork again.", components: [] });
+          return;
+        }
+        const value = interaction.values[0];
+        if (value === "__cancel__") {
+          forkMenus.delete(token);
+          await interaction.update({ content: "Fork cancelled.", components: [] });
+        } else if (value === "__prev__" || value === "__next__") {
+          menu.page = Math.max(0, Math.min(Math.ceil(menu.entries.length / FORK_PAGE_SIZE) - 1,
+            menu.page + (value === "__next__" ? 1 : -1)));
+          await interaction.update(forkMenuView(menu, token));
+        } else if (!agentBusy && menu.entries.some(entry => entry.id === value) && activeSessionManager.getEntry(value)) {
+          forkMenus.delete(token);
+          await interaction.update({ content: `Forking from entry ${value}…`, components: [] });
+          pendingReplyChannelId = interaction.channelId;
+          pendingReplyUserId = interaction.user.id;
+          const payload = Buffer.from(JSON.stringify({ command: "fork", args: value })).toString("base64url");
+          (pi.sendUserMessage as (text: string, options?: { expandPromptTemplates?: boolean }) => void)(
+            `/discord-remote-core ${payload}`, { expandPromptTemplates: true },
+          );
+        } else {
+          await interaction.reply({ content: "Pi is busy or the selected entry is unavailable. Try again when idle.", ephemeral: true });
+        }
+        return;
+      }
       if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith("pi-question:")) {
         if (interaction.channelId !== questionChannelId ||
           (activeConfig?.allowedUserIds?.length && !activeConfig.allowedUserIds.includes(interaction.user.id))) {
@@ -655,9 +779,27 @@ export default function (pi: ExtensionAPI) {
         if (coreCommand === "model") coreArgs = interaction.options.getString("model", true);
         else if (coreCommand === "thinking") coreArgs = interaction.options.getString("level", true);
         else if (coreCommand === "name") coreArgs = interaction.options.getString("name", true);
-        else if (coreCommand === "fork" || coreCommand === "tree") coreArgs = interaction.options.getString("entry", true);
+        else if (coreCommand === "tree") coreArgs = interaction.options.getString("entry", true);
         if (agentBusy && coreCommand !== "abort") {
           await interaction.reply({ content: "⏳ Pi is processing. Only /abort can run right now.", ephemeral: true });
+          return;
+        }
+        if (coreCommand === "fork") {
+          const entries = (activeSessionManager?.getEntries() ?? [])
+            .filter((entry: any) => entry.type === "message" && entry.message.role === "user")
+            .map((entry: any) => ({ id: entry.id, text: typeof entry.message.content === "string"
+              ? entry.message.content : (entry.message.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("") }))
+            .filter((entry: any) => entry.text.trim()).reverse();
+          if (!entries.length) {
+            await interaction.reply({ content: "No user messages to fork from yet.", ephemeral: true });
+            return;
+          }
+          for (const [key, menu] of forkMenus) if (Date.now() - menu.created > 10 * 60_000) forkMenus.delete(key);
+          const token = randomUUID();
+          const menu: ForkMenu = { userId: interaction.user.id, channelId: interaction.channelId,
+            sessionId: activeSessionManager.getSessionId(), entries, page: 0, created: Date.now() };
+          forkMenus.set(token, menu);
+          await interaction.reply({ ...forkMenuView(menu, token), ephemeral: true });
           return;
         }
         await interaction.reply({ content: `Running /${coreCommand}${coreArgs ? ` ${coreArgs}` : ""}…` });
@@ -724,6 +866,8 @@ export default function (pi: ExtensionAPI) {
         await message.react("⏳").catch(() => {});
       }
 
+      pendingSource = { messageId: message.id, channelId: message.channelId,
+        entryCount: activeSessionManager?.getEntries().length ?? 0, text: "" };
       pendingReplyChannelId = message.channelId;
       pendingReplyUserId = message.author.id;
       collectedAssistantText = [];
@@ -752,10 +896,12 @@ export default function (pi: ExtensionAPI) {
         }
         const prompt = [message.content, files.length ? `Attached files (local paths; use the read tool to inspect):\n${files.join("\n")}` : ""].filter(Boolean).join("\n\n");
         parts.unshift({ type: "text", text: prompt || "Please inspect the attached image(s)." });
+        if (pendingSource?.messageId === message.id) pendingSource.text = prompt || "Please inspect the attached image(s).";
         pi.sendUserMessage(parts);
       } catch (err: any) {
         pendingReplyChannelId = null;
         pendingReplyUserId = null;
+        pendingSource = null;
         await message.reply(`❌ Attachment failed: ${String(err?.message ?? err)}`).catch(() => {});
       }
     };
@@ -764,6 +910,7 @@ export default function (pi: ExtensionAPI) {
   // Keep Pi's model catalogue available for Discord slash autocomplete.
   pi.on("session_start", async (event: any, ctx: any) => {
     activeModelRegistry = ctx.modelRegistry;
+    activeSessionManager = ctx.sessionManager;
     if (!["reload", "new", "resume", "fork"].includes(event.reason)) return;
     const saved = reloadSlot[reloadKey];
     delete reloadSlot[reloadKey];
@@ -906,7 +1053,7 @@ export default function (pi: ExtensionAPI) {
                 { name: "medium", value: "medium" }, { name: "high", value: "high" }, { name: "xhigh", value: "xhigh" }, { name: "max", value: "max" },
               ));
               if (name === "name") command.addStringOption(o => o.setName("name").setDescription("New session name").setRequired(true));
-              if (name === "fork" || name === "tree") command.addStringOption(o => o.setName("entry").setDescription("Session entry ID").setRequired(true));
+              if (name === "tree") command.addStringOption(o => o.setName("entry").setDescription("Session entry ID").setRequired(true));
               return command.toJSON();
             }),
             new SlashCommandBuilder().setName("rc").setDescription("Control the Pi remote session")
@@ -1379,16 +1526,34 @@ export default function (pi: ExtensionAPI) {
           }
           case "fork": {
             if (!args || !ctx.sessionManager.getEntry(args)) throw new Error("Pass a valid session entry ID to fork from.");
-            const outcome = await ctx.fork(args, {
-              withSession: async (newCtx: any) => {
-                newCtx.ui.notify(`Forked session at ${args}.`, "info");
-              },
-            });
-            if (!outcome.cancelled) {
-              await replyAfterReplacement(`✅ Forked session at ${args}.`);
-              return;
+            const source = await findForkSource(args);
+            if (source.channel.isThread()) throw new Error("Discord cannot create a thread inside another thread.");
+            if (source.hasThread) throw new Error("This Discord message already has a thread.");
+            if (!activeConfig) throw new Error("Discord is not connected.");
+            const previousChannelId = activeConfig.channelId;
+            const thread = await source.startThread({ name: `Fork: ${source.content.replace(/\s+/g, " ").slice(0, 85) || args}` });
+            try {
+              // session_shutdown transfers this config to the replacement runtime.
+              activeConfig.channelId = thread.id;
+              const outcome = await ctx.fork(args, {
+                withSession: async (newCtx: any) => {
+                  newCtx.ui.notify(`Forked session at ${args}.`, "info");
+                },
+              });
+              if (!outcome.cancelled) {
+                await replyAfterReplacement(`✅ Forked session at ${args}. Continue in <#${thread.id}>.`);
+                if (replyToken) await sendMessageViaDiscordRest({ channelId: thread.id, token: replyToken,
+                  content: "✅ Fork ready — continue the conversation here." });
+                return;
+              }
+              activeConfig.channelId = previousChannelId;
+              await thread.delete("Fork cancelled").catch(() => {});
+              result = "Fork cancelled.";
+            } catch (error) {
+              if (activeConfig) activeConfig.channelId = previousChannelId;
+              await thread.delete("Fork failed").catch(() => {});
+              throw error;
             }
-            result = "Fork cancelled.";
             break;
           }
           case "clone": {
