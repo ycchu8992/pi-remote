@@ -310,7 +310,7 @@ export default function (pi: ExtensionAPI) {
     if (event.source !== "interactive" || !client?.isReady() || remotelyPaused || !runtime.activeChannelId) return;
     pendingReplyChannelId = runtime.activeChannelId;
     pendingReplyUserId = null;
-    for (const chunk of splitMessage(`⌨️ Terminal: ${event.text}`)) await sendToActiveChannel(chunk);
+    for (const chunk of splitMessage(`> ⌨️ Terminal: ${event.text}`)) await sendToActiveChannel(chunk);
   });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -370,7 +370,7 @@ export default function (pi: ExtensionAPI) {
       .some((c) => c.type === "thinking");
     if (hasThinking) {
       postedThinkingNotice = true;
-      await sendToActiveChannel("💭 _Thinking…_");
+      await sendToActiveChannel("> 💭 _Thinking…_");
     }
   });
 

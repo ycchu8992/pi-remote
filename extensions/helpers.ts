@@ -102,15 +102,15 @@ export function splitMessage(text: string, maxLen = 1900): string[] {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function toolLabel(toolName: string, args: any): string {
   const emojis: Record<string, string> = {
-    bash: "🔧",
-    read: "📄",
-    edit: "✏️",
-    write: "📝",
-    grep: "🔍",
-    find: "🔎",
-    ls: "📁",
+    bash: "> 🔧",
+    read: "> 📄",
+    edit: "> ✏️",
+    write: "> 📝",
+    grep: "> 🔍",
+    find: "> 🔎",
+    ls: "> 📁",
   };
-  const emoji = emojis[toolName] ?? "⚙️";
+  const emoji = emojis[toolName] ?? "> ⚙️";
   let detail = "";
   if (toolName === "bash" && args?.command) {
     const cmd = String(args.command).replace(/\n/g, " ").slice(0, 80);
