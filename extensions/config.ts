@@ -16,14 +16,24 @@ export interface Config {
   guildId: string;
   /** Optional category ID to put new channels under */
   categoryId?: string;
-  /** Fallback channel ID when not creating a new channel (legacy) */
+  /** Legacy channel ID; migrated only when no session mapping exists yet. */
   channelId?: string;
+  /** Persistent one-to-one Pi session ID → Discord channel ID mapping. */
+  sessionChannels?: Record<string, string>;
   /** Optional allow-list of Discord user IDs. Empty = allow everyone. */
   allowedUserIds?: string[];
   /** React with emoji while processing (default: true) */
   reactions?: boolean;
   /** 0 = no tool messages; 1 = calls only (default); 2 = calls and results. Booleans support older configs. */
   toolResponses?: 0 | 1 | 2 | boolean;
+}
+
+export function channelForSession(cfg: Config, sessionId: string, forkChannelId?: string): string | undefined {
+  if (cfg.sessionChannels?.[sessionId]) return cfg.sessionChannels[sessionId];
+  if (forkChannelId) return forkChannelId;
+  // Migrate a pre-mapping installation once; never assign the last active channel to another session.
+  if (!Object.keys(cfg.sessionChannels ?? {}).length) return cfg.channelId;
+  return undefined;
 }
 
 export function toolMessageLevel(value: Config["toolResponses"]): 0 | 1 | 2 {

@@ -1,10 +1,9 @@
 /**
  * pi-remote — control this Pi session from Discord
  *
- * /rc enable connects to the saved channel or creates a fresh text channel named after the
- * current working directory + date (e.g. "kaleidoscope-may09"). /rc disable
- * pauses remote messages without deleting the channel. On session shutdown the channel
- * is deleted to stay within Discord's per-server channel limit.
+ * Connections are durable, expiring resources owned by a session.
+ * /rc enable allocates; /rc connect binds/logs in; /rc disconnect retains;
+ * /rc disable destroys the resource and permanently retires its channel.
  *
  * Bot permissions required:
  *   • Read/Send Messages, Add Reactions  (existing)
@@ -12,8 +11,10 @@
  *
  * Commands:
  *   /rc setup       — interactive setup (token, guildId, categoryId, allowed users)
- *   /rc enable  — connect or resume
- *   /rc disable — pause while preserving channel and clear the UI status
+ *   /rc enable  — allocate a connection (no channel)
+ *   /rc connect — connect, creating a channel if unbound
+ *   /rc disconnect — retain resource and binding, close transport
+ *   /rc disable — destroy connection, preserve retired channel
  *   /rc status  — show connection state
  */
 
@@ -42,6 +43,7 @@ import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 
 import { loadConfig, saveConfig, toolMessageLevel, CONFIG_FILE } from "./config.js";
+import { ConnectionStore, type Connection } from "./connections.js";
 import type { Config } from "./config.js";
 import {
   makeChannelName,
@@ -62,8 +64,8 @@ const RECONNECT_MAX_ATTEMPTS = 10;
 const MAPPED_CORE_COMMANDS = [
   { name: "abort", description: "Abort the current Pi operation" },
   { name: "compact", description: "Compact the current session context" },
-  { name: "model", description: "Select a model (argument: provider/model)" },
-  { name: "thinking", description: "Set thinking level (minimal/low/medium/high/xhigh/max)" },
+  { name: "model", description: "Choose a model from a menu" },
+  { name: "thinking", description: "Choose a thinking level from a menu" },
   { name: "name", description: "Set the session display name" },
   { name: "session", description: "Show current session information" },
   { name: "new", description: "Start a new session" },
@@ -78,8 +80,11 @@ const MAPPED_CORE_COMMANDS = [
 // A reload replaces extension closures. Preserve only the intent to reconnect;
 // the old gateway is closed before the new runtime starts.
 const reloadKey = Symbol.for("pi-remote.reload");
-type ReloadState = { config: Config; cwd: string; paused: boolean };
+type ReloadState = { config: Config | null; cwd: string; enabled: boolean; connected: boolean;
+  previousFile?: string; nextChannelId?: string; previousChannelId?: string; recovery?: boolean };
 const reloadSlot = globalThis as typeof globalThis & { [reloadKey]?: ReloadState };
+const outcomeKey = Symbol.for("pi-remote.transition-outcome");
+const outcomeSlot = globalThis as typeof globalThis & { [outcomeKey]?: { ok: boolean; channelId?: string; error?: string } };
 
 export default function (pi: ExtensionAPI) {
   /** Mutable runtime state — never persisted to disk. */
@@ -95,11 +100,162 @@ export default function (pi: ExtensionAPI) {
   const runtime: RuntimeState = { activeChannelId: null, sessionChannelName: null };
   let activeModelRegistry: any = null;
   let activeSessionManager: any = null;
+  let currentSessionId: string | null = null;
+  let pendingNextChannelId: string | null = null;
+  const connections = new ConnectionStore();
+  const ownerId = randomUUID();
+  let connection: Connection | undefined;
+  let expiryTimer: ReturnType<typeof setInterval> | undefined;
+  let maintenanceRunning = false;
+  let rcCommandRunning = false;
+  let transitionPending = false;
+  let preparedChannel: any = null;
+  let recovery: { token: string; saved: ReloadState; error: string } | undefined;
+  let forceRecovery = false;
+  let preparationTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function discardPreparation(): Promise<void> {
+    if (preparationTimer) clearTimeout(preparationTimer);
+    preparationTimer = undefined;
+    const orphan = preparedChannel;
+    preparedChannel = null;
+    pendingNextChannelId = null;
+    transitionPending = false;
+    if (orphan) await orphan.delete("Session transition cancelled").catch(() => {});
+  }
+
+  async function prepareReplacement(ctx: any, forkEntry?: string): Promise<{ cancel: true } | undefined> {
+    if (forceRecovery) return;
+    if (connection) await maintainConnection();
+    if (agentBusy || questionResolver || transitionPending || rcCommandRunning) {
+      ctx.ui.notify("Cannot switch sessions while remote work or another transition is active.", "warning");
+      return { cancel: true };
+    }
+    if (!client?.isReady() || remotelyPaused) return;
+    if (!ctx.sessionManager.getSessionFile() || !existsSync(ctx.sessionManager.getSessionFile())) {
+      ctx.ui.notify("Save the original session before switching so rollback is possible.", "error");
+      return { cancel: true };
+    }
+    transitionPending = true;
+    try {
+      if (!await maintainConnection(true)) throw new Error("Original connection is unavailable.");
+      if (forkEntry) {
+        const currentChannel = await client!.channels.fetch(runtime.activeChannelId!);
+        if (currentChannel && !currentChannel.isThread()) {
+          const source = await findForkSource(forkEntry);
+          if (!source.channel.isThread() && !source.hasThread) {
+            preparedChannel = await source.startThread({ name: `Fork: ${source.content.replace(/\s+/g, " ").slice(0, 85) || forkEntry}` });
+          }
+        }
+      }
+      if (!preparedChannel) {
+        const guild = await client!.guilds.fetch(activeConfig!.guildId);
+        preparedChannel = await guild.channels.create({ name: makeChannelName(ctx.cwd), type: ChannelType.GuildText,
+          ...(activeConfig!.categoryId ? { parent: activeConfig!.categoryId } : {}), topic: "Pi session transition (preparing)" });
+      }
+      pendingNextChannelId = preparedChannel.id;
+      // Other extensions can veto after us. Reclaim preparation if shutdown never follows.
+      preparationTimer = setTimeout(() => { void discardPreparation(); }, 60_000);
+      preparationTimer.unref();
+    } catch (error) {
+      await discardPreparation();
+      ctx.ui.notify(`Session switch cancelled; original session retained: ${String(error)}`, "error");
+      await sendToChannel(runtime.activeChannelId!, `❌ Session switch failed; original session retained. ${String(error)}`);
+      return { cancel: true };
+    }
+  }
+
+  async function maintainConnection(activity = false): Promise<boolean> {
+    if (!connection || !currentSessionId) return false;
+    try {
+      if (client) {
+        connection = await connections.heartbeat(currentSessionId, connection.id, ownerId, agentBusy || !!questionResolver || transitionPending);
+        if (activity) connection = await connections.touch(currentSessionId, connection.id, ownerId);
+      } else {
+        connection = await connections.get(currentSessionId);
+      }
+      return !!connection;
+    } catch (error) {
+      const channelId = runtime.activeChannelId;
+      const token = activeConfig?.token;
+      await disconnectRemote();
+      connection = await connections.get(currentSessionId);
+      connectNotify?.(`Remote connection unavailable: ${String(error)}`, "warning");
+      if (!connection && channelId && token) {
+        await sendMessageViaDiscordRest({ channelId, token,
+          content: "⌛ Connection expired/disabled. This channel is permanently retired. Enable and connect from the Pi terminal to create a new connection and channel." }).catch(() => {});
+      }
+      return false;
+    }
+  }
+
+  async function disconnectRemote(): Promise<void> {
+    isShuttingDown = true;
+    clearReconnectTimer();
+    questionRejecter?.(new Error("Remote connection disconnected"));
+    clearQuestionState();
+    const oldClient = client;
+    client = null;
+    runtime.activeChannelId = null;
+    runtime.sessionChannelName = null;
+    pendingReplyChannelId = null;
+    pendingReplyUserId = null;
+    remotelyPaused = true;
+    if (oldClient) await oldClient.destroy().catch(() => {});
+    if (connection && currentSessionId) await connections.disconnect(currentSessionId, connection.id, ownerId);
+    connectSetStatus?.("pi-remote", undefined);
+  }
+
+  async function disableRemote(): Promise<void> {
+    if (connection && currentSessionId) await connections.destroy(currentSessionId, connection.id, ownerId);
+    await disconnectRemote();
+    connection = undefined;
+  }
+
+  function startMaintenance(): void {
+    if (expiryTimer) clearInterval(expiryTimer);
+    expiryTimer = setInterval(() => {
+      if (maintenanceRunning) return;
+      maintenanceRunning = true;
+      void maintainConnection().catch(error => console.error("[pi-remote] Maintenance failed:", error))
+        .finally(() => { maintenanceRunning = false; });
+    }, 15_000);
+    expiryTimer.unref();
+  }
   let pendingSource: { messageId: string; channelId: string; entryCount: number; text: string } | null = null;
   const discordEntryType = "pi-remote-discord-source";
   type ForkMenu = { userId: string; channelId: string; sessionId: string; entries: Array<{ id: string; text: string }>; page: number; created: number };
   const forkMenus = new Map<string, ForkMenu>();
+  type ChoiceMenu = { userId: string; channelId: string; sessionId: string; kind: "model" | "thinking";
+    entries: Array<{ label: string; value: string }>; page: number; created: number };
+  const choiceMenus = new Map<string, ChoiceMenu>();
+  const handledInteractions = new Map<string, number>();
   const FORK_PAGE_SIZE = 22;
+  const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+  function choiceMenuView(menu: ChoiceMenu, token: string) {
+    const pages = Math.ceil(menu.entries.length / FORK_PAGE_SIZE);
+    const options = menu.entries.slice(menu.page * FORK_PAGE_SIZE, (menu.page + 1) * FORK_PAGE_SIZE)
+      .map((entry, index) => ({ label: entry.label.slice(0, 100), value: String(menu.page * FORK_PAGE_SIZE + index) }));
+    if (menu.page > 0) options.push({ label: "⬅️ Previous page", value: "__prev__" });
+    if (menu.page + 1 < pages) options.push({ label: "➡️ Next page", value: "__next__" });
+    options.push({ label: "Cancel", value: "__cancel__" });
+    return {
+      content: `Choose a ${menu.kind === "model" ? "model" : "thinking level"} (page ${menu.page + 1}/${pages}).`,
+      components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder().setCustomId(`pi-choice:${token}`).setPlaceholder(`Select ${menu.kind}`).addOptions(options),
+      )],
+    };
+  }
+
+  function sendCoreCommand(command: string, args: string, channelId: string, userId: string) {
+    pendingReplyChannelId = channelId;
+    pendingReplyUserId = userId;
+    const payload = Buffer.from(JSON.stringify({ command, args })).toString("base64url");
+    (pi.sendUserMessage as (text: string, options?: { expandPromptTemplates?: boolean }) => void)(
+      `/discord-remote-core ${payload}`, { expandPromptTemplates: true },
+    );
+  }
 
   function forkMenuView(menu: ForkMenu, token: string) {
     const pages = Math.ceil(menu.entries.length / FORK_PAGE_SIZE);
@@ -141,6 +297,10 @@ export default function (pi: ExtensionAPI) {
   let questionResolver: ((answer: string) => void) | null = null;
   let questionRejecter: ((reason: Error) => void) | null = null;
   let questionChannelId: string | null = null;
+  let questionToken: string | null = null;
+  let questionMessageId: string | null = null;
+  let questionUserId: string | null = null;
+  let questionValues: string[] = [];
   let questionTimeout: ReturnType<typeof setTimeout> | null = null;
   let questionAbortListener: (() => void) | null = null;
   let questionAbortSignal: AbortSignal | null = null;
@@ -159,16 +319,23 @@ export default function (pi: ExtensionAPI) {
     questionResolver = null;
     questionRejecter = null;
     questionChannelId = null;
+    questionToken = null;
+    questionMessageId = null;
+    questionUserId = null;
+    questionValues = [];
   }
 
   // ── Shared send helpers ──────────────────────────────────────────────────
 
   async function sendToChannel(channelId: string, text: string): Promise<string | undefined> {
-    if (!client) return;
+    if (!client || remotelyPaused || transitionPending || channelId !== runtime.activeChannelId) return;
+    if (!await maintainConnection()) return;
     try {
-      const channel = (await client.channels.fetch(channelId)) as TextChannel | null;
+      const channel = (await client!.channels.fetch(channelId)) as TextChannel | null;
       if (!channel?.isTextBased()) return;
-      return (await (channel as TextChannel).send(text)).id;
+      const sent = await (channel as TextChannel).send(text);
+      await maintainConnection(true);
+      return sent.id;
     } catch (err) {
       console.error("[pi-remote] Failed to send message:", err);
     }
@@ -180,7 +347,7 @@ export default function (pi: ExtensionAPI) {
 
   function getTargetChannelId(overrideChannelId?: string): string | null {
     const override = overrideChannelId?.trim();
-    return override || runtime.activeChannelId || activeConfig?.channelId || pendingReplyChannelId || null;
+    return override || runtime.activeChannelId || null;
   }
 
   async function sendMessageViaDiscordRest(params: {
@@ -246,6 +413,9 @@ export default function (pi: ExtensionAPI) {
     }
 
     const sendOnce = async (): Promise<{ ok: boolean; sentAs?: string; error?: string }> => {
+      if (transitionPending || remotelyPaused || targetChannelId !== runtime.activeChannelId || !await maintainConnection()) {
+        return { ok: false, error: "channel_not_owned_or_disconnected" };
+      }
       const channel = (await withTimeout(
         client!.channels.fetch(targetChannelId),
         15_000,
@@ -318,12 +488,16 @@ export default function (pi: ExtensionAPI) {
     };
 
     try {
-      return await sendOnce();
+      const result = await sendOnce();
+      if (result.ok) await maintainConnection(true);
+      return result;
     } catch (err: any) {
       if (isAbortLikeError(err)) {
         try {
           await sleep(300);
-          return await sendOnce();
+          const result = await sendOnce();
+          if (result.ok) await maintainConnection(true);
+          return result;
         } catch (retryErr: any) {
           return { ok: false, error: toError(retryErr) };
         }
@@ -397,6 +571,7 @@ export default function (pi: ExtensionAPI) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   pi.on("agent_start", async (_event: any) => {
     agentBusy = true;
+    await maintainConnection();
     collectedAssistantText = [];
     postedThinkingNotice = false;
     lastImageArtifactPath = null;
@@ -494,7 +669,7 @@ export default function (pi: ExtensionAPI) {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   pi.on("agent_end", async (_event: any) => {
-    agentBusy = false;
+    try {
     if (pendingSource && activeSessionManager) {
       const source = pendingSource;
       pendingSource = null;
@@ -534,26 +709,11 @@ export default function (pi: ExtensionAPI) {
     }
     pendingReplyChannelId = null;
     pendingReplyUserId = null;
-  });
-
-  // ── Cleanup helper ───────────────────────────────────────────────────────
-
-  async function deleteSessionChannel(
-    setStatusFn: (key: string, val: string | undefined) => void,
-  ): Promise<void> {
-    if (!client || !runtime.activeChannelId) return;
-    try {
-      const channel = (await client.channels.fetch(runtime.activeChannelId)) as TextChannel | null;
-      // Keep discussion threads and their parent channels so old forks remain readable.
-      if (channel && !channel.isThread()) await channel.delete("Pi session ended");
-    } catch (err) {
-      console.error("[pi-remote] Failed to delete channel:", err);
+    } finally {
+      agentBusy = false;
+      await maintainConnection();
     }
-    runtime.activeChannelId = null;
-    runtime.sessionChannelName = null;
-    if (activeConfig) { activeConfig.channelId = undefined; await saveConfig(activeConfig); }
-    setStatusFn("pi-remote", undefined);
-  }
+  });
 
   // ── Reconnect logic ────────────────────────────────────────────────────────
 
@@ -574,7 +734,8 @@ export default function (pi: ExtensionAPI) {
       );
       reconnectFailed = true;
       if (!remotelyPaused) connectNotify?.(
-        `❌ Discord reconnect failed after ${RECONNECT_MAX_ATTEMPTS} attempts. Run /rc enable to retry.`,
+        `❌ Discord reconnect failed after ${RECONNECT_MAX_ATTEMPTS} attempts. Run /rc connect to retry.`,
+
         "error",
       );
       if (!remotelyPaused) connectSetStatus?.("pi-remote", "❌ Discord: reconnect failed");
@@ -599,7 +760,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function attemptReconnect(): Promise<void> {
-    if (!activeConfig) return;
+    if (!activeConfig || !await maintainConnection()) return;
 
     // Destroy the old client if it still exists
     if (client) {
@@ -624,8 +785,7 @@ export default function (pi: ExtensionAPI) {
       partials: [Partials.Channel, Partials.Message],
     });
 
-    client.on("messageCreate", buildMessageHandler());
-    client.on("interactionCreate", buildInteractionHandler());
+    attachHandlers(client);
     client.on("error", (err) => {
       console.error("[pi-remote] Discord client error:", err);
       if (!remotelyPaused) setStatus("pi-remote", "⚠️ Discord: error");
@@ -685,12 +845,71 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function attachHandlers(target: Client): void {
+    const message = buildMessageHandler();
+    const interaction = buildInteractionHandler();
+    target.on("messageCreate", event => {
+      if (client !== target || isShuttingDown) return;
+      void message(event).catch(error => console.error("[pi-remote] Message handler failed:", error));
+    });
+    target.on("interactionCreate", event => {
+      if (client !== target || isShuttingDown) return;
+      void interaction(event).catch(error => console.error("[pi-remote] Interaction handler failed:", error));
+    });
+  }
+
   function buildInteractionHandler() {
     return async (interaction: any) => {
+      // Ownership precedes authorization and EVERY acknowledgement, including /rc.
+      if (transitionPending || remotelyPaused || !client?.isReady() ||
+        interaction.channelId !== runtime.activeChannelId || !await maintainConnection()) return;
+      if (interaction.id) {
+        if (handledInteractions.has(interaction.id)) return;
+        const now = Date.now();
+        for (const [id, time] of handledInteractions) if (now - time > 15 * 60_000) handledInteractions.delete(id);
+        handledInteractions.set(interaction.id, now);
+      }
+      if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith("pi-choice:")) {
+        const token = interaction.customId.slice("pi-choice:".length);
+        const menu = choiceMenus.get(token);
+        if (!menu) return;
+        if (menu.userId !== interaction.user.id || menu.channelId !== interaction.channelId ||
+          (activeConfig?.allowedUserIds?.length && !activeConfig.allowedUserIds.includes(interaction.user.id))) {
+          await interaction.reply({ content: "This menu is unavailable to you.", ephemeral: true });
+          return;
+        }
+        if (Date.now() - menu.created > 10 * 60_000 || remotelyPaused ||
+          menu.channelId !== runtime.activeChannelId || menu.sessionId !== activeSessionManager?.getSessionId()) {
+          choiceMenus.delete(token);
+          await interaction.update({ content: `This menu has expired. Run /${menu.kind} again.`, components: [] });
+          return;
+        }
+        const value = interaction.values[0];
+        if (value === "__cancel__") {
+          choiceMenus.delete(token);
+          await interaction.update({ content: "Selection cancelled.", components: [] });
+        } else if (value === "__prev__" || value === "__next__") {
+          menu.page = Math.max(0, Math.min(Math.ceil(menu.entries.length / FORK_PAGE_SIZE) - 1,
+            menu.page + (value === "__next__" ? 1 : -1)));
+          await interaction.update(choiceMenuView(menu, token));
+        } else {
+          const index = Number(value);
+          const selected = Number.isInteger(index) && String(index) === value ? menu.entries[index] : undefined;
+          if (agentBusy || !selected) {
+            await interaction.reply({ content: "Pi is busy or that option is unavailable. Try again when idle.", ephemeral: true });
+            return;
+          }
+          choiceMenus.delete(token);
+          await interaction.update({ content: `Setting ${menu.kind} to ${selected.label}…`, components: [] });
+          sendCoreCommand(menu.kind, selected.value, interaction.channelId, interaction.user.id);
+        }
+        return;
+      }
       if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith("pi-fork:")) {
         const token = interaction.customId.slice("pi-fork:".length);
         const menu = forkMenus.get(token);
-        if (!menu || menu.userId !== interaction.user.id || menu.channelId !== interaction.channelId ||
+        if (!menu) return;
+        if (menu.userId !== interaction.user.id || menu.channelId !== interaction.channelId ||
           (activeConfig?.allowedUserIds?.length && !activeConfig.allowedUserIds.includes(interaction.user.id))) {
           await interaction.reply({ content: "This fork menu is unavailable to you.", ephemeral: true });
           return;
@@ -724,15 +943,19 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith("pi-question:")) {
-        if (interaction.channelId !== questionChannelId ||
+        if (interaction.customId !== `pi-question:${questionToken}` || interaction.message?.id !== questionMessageId) return;
+        if (interaction.channelId !== questionChannelId || (questionUserId && interaction.user.id !== questionUserId) ||
           (activeConfig?.allowedUserIds?.length && !activeConfig.allowedUserIds.includes(interaction.user.id))) {
           await interaction.reply({ content: "You cannot answer this question.", ephemeral: true });
           return;
         }
         const values: string[] = interaction.values ?? [];
+        if (!values.length || values.some(value => value !== "__other__" && !questionValues.includes(value))) return;
+        await maintainConnection(true);
         const value = values[0];
         if (value === "__other__") {
-          const modal = new ModalBuilder().setCustomId("pi-question-other").setTitle("Custom answer");
+          questionUserId ??= interaction.user.id;
+          const modal = new ModalBuilder().setCustomId(`pi-question-other:${questionToken}`).setTitle("Custom answer");
           const input = new TextInputBuilder().setCustomId("answer").setLabel("Your answer").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1000);
           modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
           await interaction.showModal(modal);
@@ -744,24 +967,17 @@ export default function (pi: ExtensionAPI) {
         }
         return;
       }
-      if (interaction.isModalSubmit?.() && interaction.customId === "pi-question-other") {
-        if (interaction.channelId !== questionChannelId ||
+      if (interaction.isModalSubmit?.() && interaction.customId.startsWith("pi-question-other:")) {
+        if (interaction.customId !== `pi-question-other:${questionToken}`) return;
+        if (interaction.channelId !== questionChannelId || (questionUserId && interaction.user.id !== questionUserId) ||
           (activeConfig?.allowedUserIds?.length && !activeConfig.allowedUserIds.includes(interaction.user.id))) {
           await interaction.reply({ content: "You cannot answer this question.", ephemeral: true });
           return;
         }
+        await maintainConnection(true);
         const answer = interaction.fields.getTextInputValue("answer");
         await interaction.reply({ content: "Custom answer recorded.", ephemeral: true });
         questionResolver?.(answer);
-        return;
-      }
-      if (interaction.isAutocomplete?.() && interaction.commandName === "model") {
-        const query = String(interaction.options.getFocused() ?? "").toLowerCase();
-        const choices = (activeModelRegistry?.getAvailable?.() ?? [])
-          .filter((model: any) => `${model.provider}/${model.id} ${model.name}`.toLowerCase().includes(query))
-          .slice(0, 25)
-          .map((model: any) => ({ name: `${model.name} (${model.provider}/${model.id})`.slice(0, 100), value: `${model.provider}/${model.id}` }));
-        await interaction.respond(choices);
         return;
       }
       if (!interaction.isChatInputCommand?.() || !activeConfig) return;
@@ -770,18 +986,36 @@ export default function (pi: ExtensionAPI) {
           await interaction.reply({ content: "❌ You are not on the allow-list.", ephemeral: true });
           return;
         }
-        if (remotelyPaused || interaction.channelId !== runtime.activeChannelId) {
-          await interaction.reply({ content: "Use this core command in the active session channel while connected.", ephemeral: true });
-          return;
+        if (remotelyPaused || !client?.isReady() || interaction.channelId !== runtime.activeChannelId) {
+          return; // Connection may have changed while awaiting ownership validation.
         }
         const coreCommand = interaction.commandName;
+        await maintainConnection(true);
         let coreArgs = "";
-        if (coreCommand === "model") coreArgs = interaction.options.getString("model", true);
-        else if (coreCommand === "thinking") coreArgs = interaction.options.getString("level", true);
-        else if (coreCommand === "name") coreArgs = interaction.options.getString("name", true);
+        if (coreCommand === "name") coreArgs = interaction.options.getString("name", true);
         else if (coreCommand === "tree") coreArgs = interaction.options.getString("entry", true);
         if (agentBusy && coreCommand !== "abort") {
           await interaction.reply({ content: "⏳ Pi is processing. Only /abort can run right now.", ephemeral: true });
+          return;
+        }
+        if (coreCommand === "model" || coreCommand === "thinking") {
+          // Acknowledge before looking up models to meet Discord's interaction deadline.
+          await interaction.deferReply({ ephemeral: true });
+          const entries = coreCommand === "model"
+            ? (activeModelRegistry?.getAvailable?.() ?? []).map((model: any) => ({
+              label: `${model.name} (${model.provider}/${model.id})`, value: `${model.provider}/${model.id}`,
+            }))
+            : THINKING_LEVELS.map(level => ({ label: level, value: level }));
+          if (!entries.length) {
+            await interaction.editReply({ content: "No available models found." });
+            return;
+          }
+          for (const [key, menu] of choiceMenus) if (Date.now() - menu.created > 10 * 60_000) choiceMenus.delete(key);
+          const token = randomUUID();
+          const menu: ChoiceMenu = { userId: interaction.user.id, channelId: interaction.channelId,
+            sessionId: activeSessionManager.getSessionId(), kind: coreCommand, entries, page: 0, created: Date.now() };
+          choiceMenus.set(token, menu);
+          await interaction.editReply(choiceMenuView(menu, token));
           return;
         }
         if (coreCommand === "fork") {
@@ -803,12 +1037,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         await interaction.reply({ content: `Running /${coreCommand}${coreArgs ? ` ${coreArgs}` : ""}…` });
-        pendingReplyChannelId = interaction.channelId;
-        pendingReplyUserId = interaction.user.id;
-        const payload = Buffer.from(JSON.stringify({ command: coreCommand, args: coreArgs })).toString("base64url");
-        (pi.sendUserMessage as (text: string, options?: { expandPromptTemplates?: boolean }) => void)(
-          `/discord-remote-core ${payload}`, { expandPromptTemplates: true },
-        );
+        sendCoreCommand(coreCommand, coreArgs, interaction.channelId, interaction.user.id);
         return;
       }
       if (interaction.commandName !== "rc") return;
@@ -817,18 +1046,26 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const action = interaction.options.getSubcommand();
-      if (action === "setup" || action === "enable") {
-        // Old guild command registrations may remain cached on clients until Discord refreshes them.
-        await interaction.reply({ content: `/rc ${action} is only available in the Pi terminal.`, ephemeral: true });
+      if (action === "setup") {
+        await interaction.reply({ content: "/rc setup is only available in the Pi terminal.", ephemeral: true });
         return;
       }
-      if (action === "status") {
-        await interaction.reply({ content: `Discord ${remotelyPaused ? "disabled" : client?.isReady() ? "connected" : "disconnected"}; channel: ${runtime.activeChannelId ?? "none"}`, ephemeral: true });
-      } else if (action === "disable") {
-        remotelyPaused = true;
-        pendingReplyChannelId = null;
-        connectSetStatus?.("pi-remote", undefined);
-        await interaction.reply({ content: "Remote session disabled; channel preserved.", ephemeral: true });
+      if (action === "enable" || action === "connect") {
+        await maintainConnection(true);
+        await interaction.reply({ content: "This session is already enabled and connected.", ephemeral: true });
+      } else if (action === "status") {
+        await interaction.reply({ content: `Session: ${currentSessionId}\nConnection: ${connection?.id}\nState: connected\nChannel: ${runtime.activeChannelId}\nExpires: ${new Date(connection!.expiresAt).toISOString()}`, ephemeral: true });
+      } else if (action === "disable" || action === "disconnect") {
+        await interaction.deferReply({ ephemeral: true });
+        try {
+          if (action === "disable") await disableRemote();
+          else await disconnectRemote();
+          await interaction.editReply({ content: action === "disable"
+            ? "Disabled: connection destroyed; channel retained permanently offline. Use the Pi terminal to enable a new connection."
+            : "Disconnected: connection and binding retained. Run /rc connect in the Pi terminal to reconnect." });
+        } catch (error) {
+          await interaction.editReply({ content: `Remote operation failed: ${String(error)}` });
+        }
       }
     };
   }
@@ -837,7 +1074,7 @@ export default function (pi: ExtensionAPI) {
     return async (message: Message) => {
       if (!activeConfig) return;
       if (message.author.bot) return;
-      if (remotelyPaused || message.channelId !== runtime.activeChannelId) return;
+      if (transitionPending || remotelyPaused || message.channelId !== runtime.activeChannelId || !await maintainConnection()) return;
 
       if (
         activeConfig.allowedUserIds?.length &&
@@ -847,8 +1084,16 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // If waiting for a question answer, route this message to the resolver
+      // Cancellation is not an answer, and must stop the entire questionnaire.
       if (questionResolver && message.channelId === questionChannelId) {
+        if (questionUserId && questionUserId !== message.author.id) return;
+        await maintainConnection(true);
+        if (/^(stop|cancel|停下|停止|取消|停+)[!！。\s]*$/i.test(message.content.trim())) {
+          questionRejecter?.(new Error("Questionnaire cancelled by user"));
+          clearQuestionState();
+          await message.reply("Questionnaire cancelled.");
+          return;
+        }
         if (activeConfig.reactions !== false) {
           await message.react("✅").catch(() => {});
         }
@@ -866,6 +1111,7 @@ export default function (pi: ExtensionAPI) {
         await message.react("⏳").catch(() => {});
       }
 
+      await maintainConnection(true);
       pendingSource = { messageId: message.id, channelId: message.channelId,
         entryCount: activeSessionManager?.getEntries().length ?? 0, text: "" };
       pendingReplyChannelId = message.channelId;
@@ -897,6 +1143,7 @@ export default function (pi: ExtensionAPI) {
         const prompt = [message.content, files.length ? `Attached files (local paths; use the read tool to inspect):\n${files.join("\n")}` : ""].filter(Boolean).join("\n\n");
         parts.unshift({ type: "text", text: prompt || "Please inspect the attached image(s)." });
         if (pendingSource?.messageId === message.id) pendingSource.text = prompt || "Please inspect the attached image(s).";
+        if (isShuttingDown || remotelyPaused || transitionPending || message.channelId !== runtime.activeChannelId || !await maintainConnection()) return;
         pi.sendUserMessage(parts);
       } catch (err: any) {
         pendingReplyChannelId = null;
@@ -907,51 +1154,117 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  // Keep Pi's model catalogue available for Discord slash autocomplete.
+  pi.on("session_before_switch", async (event: any, ctx: any) => {
+    try {
+      if (event.reason === "new") return await prepareReplacement(ctx);
+      if (!forceRecovery && (agentBusy || questionResolver || rcCommandRunning || transitionPending)) return { cancel: true };
+    } catch (error) {
+      ctx.ui.notify(`Cannot safely switch remote session: ${String(error)}`, "error");
+      return { cancel: true };
+    }
+  });
+  pi.on("session_before_fork", async (event: any, ctx: any) => {
+    try { return await prepareReplacement(ctx, event.position === "before" ? event.entryId : undefined); }
+    catch (error) {
+      ctx.ui.notify(`Cannot safely fork remote session: ${String(error)}`, "error");
+      return { cancel: true };
+    }
+  });
+
   pi.on("session_start", async (event: any, ctx: any) => {
     activeModelRegistry = ctx.modelRegistry;
     activeSessionManager = ctx.sessionManager;
-    if (!["reload", "new", "resume", "fork"].includes(event.reason)) return;
+    currentSessionId = ctx.sessionManager.getSessionId();
+    connectNotify = (msg, level) => ctx.ui.notify(msg, level);
+    connectSetStatus = (key, val) => ctx.ui.setStatus(key, val);
     const saved = reloadSlot[reloadKey];
     delete reloadSlot[reloadKey];
-    if (saved) {
-      await startClient(saved.config, saved.cwd,
-        (msg, level) => ctx.ui.notify(msg, level),
-        (key, val) => ctx.ui.setStatus(key, val));
-      if (client && saved.paused) {
-        remotelyPaused = true;
-        ctx.ui.setStatus("pi-remote", undefined);
+    startMaintenance();
+    connection = await connections.get(currentSessionId!);
+    if (!saved || event.reason === "startup") return;
+    const creating = event.reason === "new" || event.reason === "fork";
+    outcomeSlot[outcomeKey] = { ok: false };
+    try {
+      if (creating && saved.enabled) connection = await connections.enable(currentSessionId!);
+      // Resume/startup never carry the flame, except explicit rollback to S1.
+      const reconnect = (creating || event.reason === "reload" || saved.recovery) && saved.connected;
+      if (reconnect && saved.config) {
+        await startClient(saved.config, ctx.cwd, connectNotify, connectSetStatus, saved.nextChannelId);
       }
+      outcomeSlot[outcomeKey] = { ok: true, channelId: runtime.activeChannelId ?? undefined };
+    } catch (error) {
+      outcomeSlot[outcomeKey] = { ok: false, error: String(error) };
+      if (creating) {
+        await disableRemote().catch(() => {});
+        if (saved.nextChannelId && saved.config) {
+          await new REST({ version: "10" }).setToken(saved.config.token)
+            .delete(Routes.channel(saved.nextChannelId)).catch(() => {});
+        }
+        if (saved.previousFile) {
+          isShuttingDown = false; // Failed connect closed transport, not this replacement runtime.
+          recovery = { token: randomUUID(), saved, error: String(error) };
+          // Session changes are command-only. Never call switchSession from session_start.
+          const token = recovery.token;
+          setTimeout(() => {
+            if (recovery?.token === token && !isShuttingDown) {
+              (pi.sendUserMessage as (text: string, options: { expandPromptTemplates: boolean }) => void)(
+                `/discord-remote-recover ${token}`, { expandPromptTemplates: true });
+            }
+          }, 0);
+        }
+      }
+      ctx.ui.notify(`Remote transition failed: ${String(error)}${recovery ? "; restoring original session…" : ""}`, "error");
     }
   });
 
-  // ── Session cleanup ───────────────────────────────────────────────────────
+  pi.registerCommand("discord-remote-recover", {
+    description: "Internal authenticated rollback after a failed remote session transition",
+    handler: async (token: string, ctx: any) => {
+      if (!recovery || recovery.token !== token.trim()) return;
+      const failed = recovery;
+      recovery = undefined;
+      forceRecovery = true;
+      reloadSlot[reloadKey] = { ...failed.saved, nextChannelId: undefined, recovery: true };
+      const report = async (text: string) => {
+        if (failed.saved.config && failed.saved.previousChannelId) {
+          await sendMessageViaDiscordRest({ token: failed.saved.config.token, channelId: failed.saved.previousChannelId, content: text });
+        }
+      };
+      try {
+        const result = await ctx.switchSession(failed.saved.previousFile!, { withSession: async (fresh: any) => {
+          const restored = outcomeSlot[outcomeKey]?.ok;
+          const text = restored ? `❌ Switch failed; original session and connection restored. ${failed.error}`
+            : `❌ Switch failed, and reconnecting the original session also failed. Use /rc connect in its terminal. ${failed.error}`;
+          fresh.ui.notify(text, "error");
+          await report(text);
+        } });
+        if (result.cancelled) throw new Error("Rollback was cancelled");
+      } catch (error) {
+        await report(`❌ Switch failed and rollback failed: ${String(error)}. Resume the original session from the terminal.`);
+      } finally {
+        forceRecovery = false;
+        delete reloadSlot[reloadKey];
+      }
+    },
+  });
 
-  pi.on("session_shutdown", async (event: any) => {
-    // Reject any pending question so tool execution doesn't hang
-    if (questionRejecter) {
-      questionRejecter(new Error("Session shut down"));
-    }
-    clearQuestionState();
-    clearReconnectTimer();
-    isShuttingDown = true;
-    const replacing = ["reload", "new", "resume", "fork"].includes(event?.reason);
-    if (replacing && client && activeConfig) {
-      reloadSlot[reloadKey] = { config: activeConfig, cwd: process.cwd(), paused: remotelyPaused };
-    }
-    if (client) {
-      if (!replacing) await deleteSessionChannel((_k, _v) => {});
-      const oldClient = client;
-      client = null;
-      await oldClient.destroy().catch(() => {});
-      client = null;
+  pi.on("session_shutdown", async (event: any, ctx: any) => {
+    if (expiryTimer) clearInterval(expiryTimer);
+    if (preparationTimer) clearTimeout(preparationTimer);
+    try {
+      if (currentSessionId) connection = await connections.get(currentSessionId);
+      if (!forceRecovery && ["reload", "new", "resume", "fork"].includes(event.reason)) {
+        reloadSlot[reloadKey] = { config: activeConfig, cwd: ctx.cwd,
+          enabled: !!connection, connected: !!client?.isReady() && !remotelyPaused,
+          previousFile: ctx.sessionManager.getSessionFile(), previousChannelId: runtime.activeChannelId ?? undefined,
+          nextChannelId: pendingNextChannelId ?? undefined };
+      }
+    } finally {
+      await disconnectRemote();
+      preparedChannel = null;
       activeConfig = null;
-      runtime.activeChannelId = null;
-      runtime.sessionChannelName = null;
     }
   });
-
-  // Auto-connect removed — user must run /rc enable explicitly.
 
   // ── Connect + channel-create helper ──────────────────────────────────────
 
@@ -960,25 +1273,20 @@ export default function (pi: ExtensionAPI) {
     cwd: string,
     notifyFn: (msg: string, level: "success" | "error" | "warning" | "info") => void,
     setStatusFn: (key: string, val: string | undefined) => void,
+    nextChannelId?: string,
   ): Promise<void> {
-    if (client && reconnectFailed) {
-      const failedClient = client;
-      client = null;
-      await failedClient.destroy().catch(() => {});
-    }
-    if (client) {
-      if (remotelyPaused) {
-        remotelyPaused = false;
-        notifyFn("Resumed Discord remote messages.", "success");
-        setStatusFn("pi-remote", `🔌 Discord: #${runtime.sessionChannelName ?? runtime.activeChannelId ?? "unknown"}`);
-      } else {
-        notifyFn("Already connected to Discord.", "warning");
-      }
+    if (!currentSessionId) throw new Error("No active Pi session ID.");
+    const sessionId = currentSessionId;
+    if (client?.isReady() && runtime.activeChannelId && await maintainConnection()) {
+      notifyFn("Already connected to Discord.", "info");
       return;
     }
-
+    if (client) await disconnectRemote();
+    connection = await connections.get(sessionId);
+    if (!connection) throw new Error("Remote control is disabled. Run /rc enable first.");
+    connection = await connections.claim(sessionId, connection.id, ownerId);
     activeConfig = cfg;
-    remotelyPaused = false;
+    remotelyPaused = true; // Do not accept events until binding and registration succeed.
     isShuttingDown = false;
     reconnectAttempt = 0;
     reconnectFailed = false;
@@ -998,8 +1306,7 @@ export default function (pi: ExtensionAPI) {
       partials: [Partials.Channel, Partials.Message],
     });
 
-    client.on("messageCreate", buildMessageHandler());
-    client.on("interactionCreate", buildInteractionHandler());
+    attachHandlers(client);
 
     // ── Reconnection handling (for post-connect disconnects only) ──────
     client.on("error", (err) => {
@@ -1032,48 +1339,55 @@ export default function (pi: ExtensionAPI) {
         const channelName = makeChannelName(cwd);
         try {
           const guild = await c.guilds.fetch(cfg.guildId);
-          const savedChannel = cfg.channelId ? await guild.channels.fetch(cfg.channelId).catch(() => null) : null;
+          if (client !== c || isShuttingDown) throw new Error("Connection attempt cancelled");
+          const candidateId = connection!.channelId ?? nextChannelId;
+          const savedChannel = candidateId ? await guild.channels.fetch(candidateId) : null;
+          if (client !== c || isShuttingDown) throw new Error("Connection attempt cancelled");
+          if (candidateId && !savedChannel?.isTextBased()) {
+            throw new Error("Bound/prepared channel is missing or not text-based; refusing to rebind.");
+          }
           const newChannel = savedChannel?.isTextBased() ? savedChannel : await guild.channels.create({
             name: channelName,
             type: ChannelType.GuildText,
             ...(cfg.categoryId ? { parent: cfg.categoryId } : {}),
-            topic: `Pi session — ${cwd}`,
+            topic: `Pi session ${sessionId} — ${cwd}`,
           });
+          try {
+            if (client !== c || isShuttingDown) throw new Error("Connection attempt cancelled");
+            connection = await connections.bind(sessionId, connection!.id, ownerId, newChannel.id);
+          } catch (error) {
+            if (!candidateId) await newChannel.delete("Connection binding failed").catch(() => {});
+            throw error;
+          }
           runtime.activeChannelId = newChannel.id;
           runtime.sessionChannelName = newChannel.name;
-          cfg.channelId = newChannel.id;
-          await saveConfig(cfg);
           const rest = new REST({ version: "10" }).setToken(cfg.token);
           await rest.put(Routes.applicationGuildCommands(c.user!.id, cfg.guildId), { body: [
             ...MAPPED_CORE_COMMANDS.map(({ name, description }) => {
               const command = new SlashCommandBuilder().setName(name).setDescription(description);
-              if (name === "model") command.addStringOption(o => o.setName("model").setDescription("Choose a configured model").setRequired(true).setAutocomplete(true));
-              if (name === "thinking") command.addStringOption(o => o.setName("level").setDescription("Thinking level").setRequired(true).addChoices(
-                { name: "off", value: "off" }, { name: "minimal", value: "minimal" }, { name: "low", value: "low" },
-                { name: "medium", value: "medium" }, { name: "high", value: "high" }, { name: "xhigh", value: "xhigh" }, { name: "max", value: "max" },
-              ));
               if (name === "name") command.addStringOption(o => o.setName("name").setDescription("New session name").setRequired(true));
               if (name === "tree") command.addStringOption(o => o.setName("entry").setDescription("Session entry ID").setRequired(true));
               return command.toJSON();
             }),
             new SlashCommandBuilder().setName("rc").setDescription("Control the Pi remote session")
-              .addSubcommand(s => s.setName("disable").setDescription("Pause and preserve the channel"))
+              .addSubcommand(s => s.setName("disable").setDescription("Destroy this session's connection; preserve channel"))
+              .addSubcommand(s => s.setName("enable").setDescription("Allocate a connection (use the Pi terminal when offline)"))
+              .addSubcommand(s => s.setName("connect").setDescription("Connect an enabled session (Pi terminal when offline)"))
+              .addSubcommand(s => s.setName("disconnect").setDescription("Disconnect but retain the connection resource"))
               .addSubcommand(s => s.setName("status").setDescription("Show connection status"))
               .toJSON(),
           ] });
 
-          const label = `🔌 Discord: #${channelName}`;
-          notifyFn(`Connected as ${c.user!.tag} → #${channelName}`, "success");
+          if (client !== c || isShuttingDown) throw new Error("Connection attempt cancelled");
+          connection = await connections.touch(sessionId, connection!.id, ownerId);
+          if (client !== c || isShuttingDown) throw new Error("Connection attempt cancelled");
+          remotelyPaused = false;
+          const label = `🔌 Discord: #${newChannel.name}`;
+          notifyFn(`Connected as ${c.user!.tag} → #${newChannel.name}`, "success");
           setStatusFn("pi-remote", label);
         } catch (err) {
-          // Channel creation failed — fall back to configured channelId
-          console.error("[pi-remote] Could not create channel:", err);
-          notifyFn(
-            `⚠️ Could not create channel (check Manage Channels permission). Falling back to configured channelId.`,
-            "warning",
-          );
-          runtime.activeChannelId = cfg.channelId ?? null;
-          setStatusFn("pi-remote", `🔌 Discord: ${c.user!.tag} (fallback)`);
+          reject(err);
+          return;
         }
         resolve();
       };
@@ -1084,19 +1398,16 @@ export default function (pi: ExtensionAPI) {
     void readyPromise.catch(() => {});
     try {
       setStatusFn("pi-remote", "🔌 Discord: connecting…");
-      await client.login(cfg.token);
-      await readyPromise;
+      await withTimeout(client.login(cfg.token), 30_000, "discord_login");
+      await withTimeout(readyPromise, 45_000, "discord_binding");
     } catch (err: any) {
       // Initial login failure — clean up and notify immediately
       console.error("[pi-remote] Initial login failed:", err.message);
       cancelInitialReady();
-      await client.destroy().catch(() => {});
-      client = null;
-      activeConfig = null;
-      connectNotify = null;
-      connectSetStatus = null;
+      await disconnectRemote();
       notifyFn(`❌ Failed to connect: ${err.message}`, "error");
       setStatusFn("pi-remote", undefined);
+      throw err;
     }
   }
 
@@ -1107,15 +1418,15 @@ export default function (pi: ExtensionAPI) {
   // When Discord is not connected, let the original tool through as fallback.
   pi.on("tool_call", async (event, _ctx) => {
     if (event.toolName !== "ask_user_question") return;
-    if (!client?.isReady()) return; // Discord not ready — let TUI tool work
+    if (!client?.isReady() || remotelyPaused || !runtime.activeChannelId || !await maintainConnection()) return;
     return { block: true, reason: "Discord is connected — use discord_ask_user_question instead." };
   });
 
   // ── System prompt hint: prefer Discord version when connected ──────────
 
   pi.on("before_agent_start", async (event, _ctx) => {
-    if (!client?.isReady()) return;
-    const activeChannelId = runtime.activeChannelId ?? activeConfig?.channelId;
+    if (!client?.isReady() || remotelyPaused || !runtime.activeChannelId || !await maintainConnection()) return;
+    const activeChannelId = runtime.activeChannelId;
     return {
       systemPrompt:
         event.systemPrompt +
@@ -1139,6 +1450,7 @@ export default function (pi: ExtensionAPI) {
   // When Discord is connected, use this tool instead of ask_user_question.
   pi.registerTool({
     name: "discord_ask_user_question",
+    executionMode: "sequential",
     label: "Ask User Question (Discord)",
     description:
       "Ask the user one or more structured clarifying questions via Discord. " +
@@ -1164,7 +1476,7 @@ export default function (pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
       const channelId = pendingReplyChannelId;
-      if (!client || !channelId) {
+      if (!client?.isReady() || remotelyPaused || transitionPending || !channelId || channelId !== runtime.activeChannelId || !await maintainConnection()) {
         return {
           content: [
             {
@@ -1220,8 +1532,30 @@ export default function (pi: ExtensionAPI) {
             details: { answers, cancelled: true, error: "too_many_options" },
           };
         }
-        // Use a Discord select menu for structured choices; the final option opens a modal.
+        // Install the waiter BEFORE publishing the component. IDs are unique per question.
+        if (questionResolver) throw new Error("Another questionnaire is already waiting for an answer.");
+        questionToken = randomUUID();
+        questionChannelId = channelId;
+        questionUserId = pendingReplyUserId;
+        questionValues = q.options.map(option => option.label);
+        const answerPromise = new Promise<string>((resolve, reject) => {
+          questionResolver = resolve;
+          questionRejecter = reject;
+          questionTimeout = setTimeout(() => {
+            reject(new Error("Question timed out — no response in 5 minutes"));
+            clearQuestionState();
+          }, 300_000);
+          if (signal) {
+            const onAbort = () => { reject(new Error("Question cancelled")); clearQuestionState(); };
+            questionAbortListener = onAbort;
+            questionAbortSignal = signal;
+            if (signal.aborted) onAbort();
+            else signal.addEventListener("abort", onAbort, { once: true });
+          }
+        });
+        void answerPromise.catch(() => {});
         try {
+          if (signal?.aborted) throw new Error("Question cancelled");
           const choices = q.options.map((option: any, index: number) => ({
             label: `${index + 1}. ${option.label}`.slice(0, 100),
             value: option.label,
@@ -1229,46 +1563,26 @@ export default function (pi: ExtensionAPI) {
           }));
           choices.push({ label: "Other — enter a custom answer", value: "__other__", description: "Type an answer not listed above" });
           const menu = new StringSelectMenuBuilder()
-            .setCustomId(`pi-question:${qi}`)
+            .setCustomId(`pi-question:${questionToken}`)
             .setPlaceholder(q.multiSelect ? "Choose one or more options" : "Choose an option")
             .setMinValues(1)
             .setMaxValues(q.multiSelect ? Math.max(1, choices.length - 1) : 1)
             .addOptions(choices);
-          await channel.send({ content: questionText, components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)] });
+          const sent = await channel.send({ content: questionText, components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)] });
+          questionMessageId = sent.id;
+          await maintainConnection(true);
         } catch {
+          questionRejecter?.(new Error("Failed to send question"));
+          clearQuestionState();
           return {
             content: [{ type: "text", text: "Failed to send question to Discord." }],
             details: { answers: [], cancelled: true, error: "no_ui" },
           };
         }
 
-        // Wait for answer
-        questionChannelId = channelId;
         let answerText: string;
         try {
-          answerText = await new Promise<string>((resolve, reject) => {
-            questionResolver = resolve;
-            questionRejecter = reject;
-
-            questionTimeout = setTimeout(() => {
-              clearQuestionState();
-              reject(new Error("Question timed out — no response in 5 minutes"));
-            }, 300_000);
-
-            const onAbort = () => {
-              clearQuestionState();
-              reject(new Error("Session shut down while waiting for question answer"));
-            };
-            if (signal) {
-              if (signal.aborted) {
-                onAbort();
-                return;
-              }
-              questionAbortListener = onAbort;
-              questionAbortSignal = signal;
-              signal.addEventListener("abort", onAbort, { once: true });
-            }
-          });
+          answerText = await answerPromise;
         } catch (err: any) {
           clearQuestionState();
           return {
@@ -1518,42 +1832,26 @@ export default function (pi: ExtensionAPI) {
               },
             });
             if (!outcome.cancelled) {
-              await replyAfterReplacement("✅ Started a new Pi session.");
+              const next = outcomeSlot[outcomeKey];
+              await replyAfterReplacement(next?.ok ? `✅ Started a new Pi session. Continue in <#${next.channelId}>.`
+                : "❌ New connection failed; restoring the original session.");
               return;
             }
-            result = "New session cancelled.";
+            await discardPreparation();
+            result = "New session cancelled; original session retained.";
             break;
           }
           case "fork": {
             if (!args || !ctx.sessionManager.getEntry(args)) throw new Error("Pass a valid session entry ID to fork from.");
-            const source = await findForkSource(args);
-            if (source.channel.isThread()) throw new Error("Discord cannot create a thread inside another thread.");
-            if (source.hasThread) throw new Error("This Discord message already has a thread.");
-            if (!activeConfig) throw new Error("Discord is not connected.");
-            const previousChannelId = activeConfig.channelId;
-            const thread = await source.startThread({ name: `Fork: ${source.content.replace(/\s+/g, " ").slice(0, 85) || args}` });
-            try {
-              // session_shutdown transfers this config to the replacement runtime.
-              activeConfig.channelId = thread.id;
-              const outcome = await ctx.fork(args, {
-                withSession: async (newCtx: any) => {
-                  newCtx.ui.notify(`Forked session at ${args}.`, "info");
-                },
-              });
-              if (!outcome.cancelled) {
-                await replyAfterReplacement(`✅ Forked session at ${args}. Continue in <#${thread.id}>.`);
-                if (replyToken) await sendMessageViaDiscordRest({ channelId: thread.id, token: replyToken,
-                  content: "✅ Fork ready — continue the conversation here." });
-                return;
-              }
-              activeConfig.channelId = previousChannelId;
-              await thread.delete("Fork cancelled").catch(() => {});
-              result = "Fork cancelled.";
-            } catch (error) {
-              if (activeConfig) activeConfig.channelId = previousChannelId;
-              await thread.delete("Fork failed").catch(() => {});
-              throw error;
+            const outcome = await ctx.fork(args);
+            if (!outcome.cancelled) {
+              const next = outcomeSlot[outcomeKey];
+              await replyAfterReplacement(next?.ok ? `✅ Forked session. Continue in <#${next.channelId}>.`
+                : "❌ Fork connection failed; restoring the original session.");
+              return;
             }
+            await discardPreparation();
+            result = "Fork cancelled; original session retained.";
             break;
           }
           case "clone": {
@@ -1566,10 +1864,13 @@ export default function (pi: ExtensionAPI) {
               },
             });
             if (!outcome.cancelled) {
-              await replyAfterReplacement("✅ Cloned the current session position.");
+              const next = outcomeSlot[outcomeKey];
+              await replyAfterReplacement(next?.ok ? `✅ Cloned session. Continue in <#${next.channelId}>.`
+                : "❌ Clone connection failed; restoring the original session.");
               return;
             }
-            result = "Clone cancelled.";
+            await discardPreparation();
+            result = "Clone cancelled; original session retained.";
             break;
           }
           case "tree": {
@@ -1600,11 +1901,16 @@ export default function (pi: ExtensionAPI) {
   // ── Command ───────────────────────────────────────────────────────────────
 
   pi.registerCommand("rc", {
-    description: "Control this Pi session from Discord (creates a new channel per session)",
+    description: "Manage this session's expiring Discord connection resource",
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     handler: async (args: any, ctx: any) => {
       const cmd = (args ?? "").trim().split(/\s+/)[0];
-
+      if (rcCommandRunning || transitionPending) {
+        ctx.ui.notify("A remote operation is already in progress. Please wait.", "warning");
+        return;
+      }
+      rcCommandRunning = true;
+      try {
       switch (cmd) {
         // ── setup ─────────────────────────────────────────────────────────
         case "setup": {
@@ -1647,6 +1953,7 @@ export default function (pi: ExtensionAPI) {
           const cfg: Config = {
             token,
             guildId,
+            ...(existing && existing.guildId === guildId ? { sessionChannels: existing.sessionChannels, channelId: existing.channelId } : {}),
             ...(categoryId ? { categoryId } : {}),
             ...(allowedUserIds ? { allowedUserIds } : {}),
             reactions: true,
@@ -1658,63 +1965,51 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
-        // ── enable ────────────────────────────────────────────────────────
         case "enable": {
           activeModelRegistry = ctx.modelRegistry;
+          activeConfig = await loadConfig();
+          if (!activeConfig) throw new Error("No config found. Run /rc setup first.");
+          // Old mapping-only channels are retired, never silently rebound to a new resource.
+          await connections.retireLegacyChannels([
+            ...Object.values(activeConfig.sessionChannels ?? {}), ...(activeConfig.channelId ? [activeConfig.channelId] : []),
+          ]);
+          connection = await connections.enable(currentSessionId!);
+          ctx.ui.notify(`Remote enabled. Connection: ${connection.id}. Run /rc connect to connect.`, "info");
+          break;
+        }
+        case "connect": {
           const cfg = await loadConfig();
-          if (!cfg) {
-            ctx.ui.notify("No config found. Run /rc setup first.", "error");
-            return;
-          }
-          await startClient(
-            cfg,
-            ctx.cwd,
-            (msg, level) => ctx.ui.notify(msg, level),
-            (key, val) => ctx.ui.setStatus(key, val),
-          );
+          if (!cfg) throw new Error("No config found. Run /rc setup first.");
+          await startClient(cfg, ctx.cwd, (msg, level) => ctx.ui.notify(msg, level),
+            (key, val) => ctx.ui.setStatus(key, val));
           break;
         }
-
-        // Pause messages while preserving the channel for /rc enable.
+        case "disconnect": {
+          await disconnectRemote();
+          ctx.ui.notify("Disconnected; connection and channel binding retained.", "info");
+          break;
+        }
         case "disable": {
-          remotelyPaused = true;
-          pendingReplyChannelId = null;
-          ctx.ui.setStatus("pi-remote", undefined);
+          connection = await connections.get(currentSessionId!);
+          await disableRemote();
+          ctx.ui.notify("Disabled; connection destroyed. Its channel cannot be reused.", "info");
           break;
         }
-
-        // ── status ────────────────────────────────────────────────────────
         case "status": {
-          if (remotelyPaused) { ctx.ui.notify(`⏸️ Paused; channel preserved: ${runtime.activeChannelId ?? "none"}`, "info"); break; }
-          if (client?.isReady()) {
-            ctx.ui.notify(
-              `✅ Connected as ${client.user.tag}\n` +
-                `   Channel: #${runtime.sessionChannelName ?? runtime.activeChannelId ?? "(fallback)"}\n` +
-                `   Channel ID: ${runtime.activeChannelId ?? "(unknown)"}\n` +
-                `   Allow-list: ${activeConfig?.allowedUserIds?.join(", ") || "everyone"}`,
-              "info",
-            );
-          } else if (client) {
-            ctx.ui.notify("⏳ Connecting…", "info");
-          } else if (reconnectTimer) {
-            ctx.ui.notify(
-              `🔄 Reconnecting (attempt ${reconnectAttempt}/${RECONNECT_MAX_ATTEMPTS})…`,
-              "info",
-            );
-          } else if (reconnectFailed) {
-            ctx.ui.notify(
-              `❌ Reconnect failed after ${RECONNECT_MAX_ATTEMPTS} attempts. Run /rc enable to retry.`,
-              "error",
-            );
-          } else {
-            ctx.ui.notify("❌ Not connected. Run /rc enable.", "info");
-          }
+          await maintainConnection();
+          connection = await connections.get(currentSessionId!);
+          ctx.ui.notify(`Session: ${currentSessionId}\nConnection: ${connection?.id ?? "none"}\n` +
+            `State: ${!connection ? "disabled" : client?.isReady() && !remotelyPaused ? "connected" : "enabled / disconnected"}\n` +
+            `Channel: ${connection?.channelId ?? "none"}\nExpires: ${connection ? new Date(connection.expiresAt).toISOString() : "n/a"}`, "info");
           break;
         }
 
         default: {
-          ctx.ui.notify("Unknown /rc command. Use setup, enable, disable, or status.", "error");
+          ctx.ui.notify("Unknown /rc command. Use setup, enable, connect, disconnect, disable, or status.", "error");
         }
+      }
+      } finally {
+        rcCommandRunning = false;
       }
     },
   });

@@ -4,4 +4,4 @@ dist/
 .DS_Store
 .env
 TODO.md
-extensions/__tests__/
+extensions/__tests__/*

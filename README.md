@@ -2,11 +2,11 @@
 
 > Control your [Pi](https://pi.dev) coding-agent session from Discord.
 
-`/rc enable` connects the extension and creates a Discord text channel on first use. Later connections reuse the saved channel. Messages in the channel are injected into Pi as prompts. `/rc disable` pauses message handling and clears the UI indicator, but preserves the channel.
+A **session** is a Pi agent session; a **channel** is a Discord text channel (forks may use a thread); a **connection** is a durable resource owned exclusively by one session, even while disconnected. Run `/rc enable` to allocate the resource, then `/rc connect` to bind a channel and connect. Messages in that channel become prompts in the owning session.
 
 ## Install
 
-The npm package is not published yet. For now, install from the source repository. Requires [Pi](https://pi.dev), Git, and Node.js 18 or newer:
+The npm package is not published yet. For now, install from the source repository. Requires [Pi](https://pi.dev) 0.87.1 (command dispatch and replacement-context APIs), Git, and Node.js 22.19 or newer:
 
 ```bash
 git clone https://github.com/ycchu8992/pi-discord-remote.git
@@ -31,10 +31,12 @@ Restart Pi to load the extension, then run `/rc setup` in Pi to configure your D
 ## Usage
 
 ```
-/rc setup    — configure token, server ID, optional category
-/rc enable   — connect or resume (reuses saved channel)
-/rc disable  — pause, preserve channel, clear UI indicator
-/rc status   — show connection state
+/rc setup       — configure token, server ID, optional category
+/rc enable      — allocate this session's connection; no login or channel creation
+/rc connect     — connect; reuse this connection's channel or create one
+/rc disconnect  — disconnect; retain connection and channel binding
+/rc disable     — destroy connection; preserve but permanently retire its channel
+/rc status      — show session, resource ID, state, channel, and expiration
 ```
 
 ### Setup prompts
@@ -47,7 +49,7 @@ Restart Pi to load the extension, then run `/rc setup` in Pi to configure your D
 | Allowed user IDs | Right-click a user → Copy User ID (leave empty to allow everyone) |
 | Tool messages | Choose `0` (hide tool calls and results), `1` (calls only, default), or `2` (calls and results) |
 
-Config is stored at `~/.pi/agent/p-remote/config.json`.
+Credentials/settings are stored at `~/.pi/agent/pi-remote/config.json`. Non-secret connection resources and permanent channel tombstones are stored separately in `connections.json` in the same directory. Registry updates use a cross-process lock and atomic file replacement.
 
 ### Environment variables (alternative to config file)
 
@@ -74,18 +76,29 @@ To change configuration, run `/rc setup` again or edit `~/.pi/agent/pi-remote/co
 
 ## How it works
 
-The extension loads silently on Pi startup — no channel is created until you explicitly run the command.
+The extension loads silently. Startup and `/resume` do not automatically connect; use `/rc connect` for a retained, unexpired resource. An expired or disabled session first needs `/rc enable`.
 
-- **`/rc enable`** — bot logs in, reuses its saved channel (or creates one named `<project>-<mon><dd>-<HHMM>`), and listens there only
-- **Incoming message** — injected as a user prompt into the active Pi session; bot reacts ⏳ while Pi works, then posts the full response back
-- **Tool messages** — `toolResponses: 0` hides tool calls and results, `1` shows only tool-call labels (🔧 bash, 📄 read, ✏️ edit, etc.), and `2` also shows ↩️/❌ result code blocks. Assistant replies are unaffected.
-- **`/rc disable`** — pause remote messages and clear the Pi status indicator without deleting the channel; `/rc enable` resumes it. Pi exit deletes an active regular channel (threads are preserved) and disconnects.
-- Discord only exposes `/rc status` and `/rc disable`; `/rc setup` and `/rc enable` are terminal-only and cannot be run from Discord. Core Pi commands with public API mappings are exposed directly as Discord slash commands: `/model` (with live model autocomplete), `/thinking`, `/name`, `/session`, `/new`, `/compact`, `/abort`, `/fork`, `/clone`, `/tree`, and `/reload`. `/fork` opens a private, paginated mobile-friendly picker of user messages from the current session; choosing one creates a Discord thread on its original message and routes the forked Pi session to that thread. The bot needs **Create Public Threads** and **Send Messages in Threads** permissions. Discord cannot nest threads: messages already inside a thread cannot be forked into another thread. Existing history without a recorded Discord message ID is matched only when the original message can be identified unambiguously in the current channel (up to 2,000 messages); otherwise the fork is rejected without selecting an unrelated message. Other extension, skill, and prompt commands are not available through Discord. Commands that require TUI-only UI (for example `/settings` or `/login`) are not mapped.
+- **Ownership** — one resource per session, never transferable. One channel/thread can belong to only one resource for its entire lifetime. Destroying a resource permanently retires its channel, even for the same session. Re-enabling allocates a new resource and subsequent connect creates a new channel.
+- **Disconnect vs. disable** — disconnect and `/quit` retain the resource and its binding; disable destroys the resource. Neither deletes the Discord channel or the session history. Without a gateway, offline channels cannot receive commands: reconnect from the Pi terminal.
+- **New/clone** — create a new session. Disabled stays disabled; enabled/disconnected gets a new unbound resource; connected carries the “flame” to a new resource and channel. The original resource is disconnected, not destroyed. These commands never add another simultaneously connected worker. Start another terminal and explicitly enable/connect to do that.
+- **Fork** — same resource/state inheritance, but uses a new thread on the selected original message when possible. Forking from a thread, or an original message which already has a thread, falls back to a new ordinary channel. With no connection, the session remains disconnected and a later connect creates an ordinary channel. The bot needs **Create Public Threads** and **Send Messages in Threads**. Ambiguous historical source-message matches are rejected, not guessed.
+- **Switch failure** — Discord destination preparation runs before leaving S1. Failure there cancels the switch. Failure connecting S2 destroys its incomplete resource, removes its newly prepared destination, and schedules a command-context rollback to S1 with a notification in the original channel. If the Pi host cannot create any replacement runtime at all, or rollback itself fails, terminal recovery is required; never assume success from a created channel alone. Connected transitions require a saved original session so rollback has a valid path.
+- **Reload** — keeps the same resource/channel and reconnects only if previously connected.
+- **Expiry** — 24 hours since allocation or last meaningful use. Successful connect, accepted remote input, and sent messages refresh activity; status queries/lease heartbeats do not. Live work and bounded question waits defer destruction. A crashed worker cannot hold a resource busy forever: ownership leases expire after 60 seconds, renewed every 15 seconds. After a crash, another runtime may need to wait for that lease before connecting.
+- **Offline expiry** — the deadline remains authoritative without a daemon. Startup/access sweeps expired resources; connected runtimes also check every 15 seconds and before processing events. Nothing reconnects an expired resource. There is no connection-count limit, gateway, channel cleanup command, or channel-name status marker in this version.
+- **Routing** — foreign channels and unknown menu/question IDs are ignored before acknowledgement. Duplicate ownership of a resource is rejected. All participating Pi processes must run this version; legacy runtimes do not honor these leases.
+- **Incoming messages** — injected as prompts; bot reacts ⏳ and posts the response. `toolResponses` selects hidden/calls/calls+results as before.
+
+Discord exposes `/rc status`, `/rc disconnect`, `/rc disable`, and idempotent `/rc enable`/`connect` for already connected sessions. `/rc setup` is terminal-only. Core slash commands: `/model`, `/thinking`, `/name`, `/session`, `/new`, `/compact`, `/abort`, `/fork`, `/clone`, `/tree`, and `/reload`. Other extension/skill/TUI-only commands are not mapped.
+
+### Upgrade from mapping-only versions
+
+Stop or disconnect **all old-version Pi runtimes** before activating this version; do not mix versions using the same bot. Existing `sessionChannels`/`channelId` settings are treated as legacy, retired channels, not imported as live connections. In each desired terminal run `/rc enable`, then `/rc connect`; this creates a fresh channel. Existing Discord history is not deleted. Build/install does not itself reload running Pi sessions.
 
 ### Sending files and artifacts
 
 Forwarding is opt-in. Use `discord_send_file` to upload a local artifact/file (or URL/base64) to the active channel. For image-specific forwarding, the tool accepts the same path/URL/base64 inputs.
-- optional `channelId` (recommended for deterministic targeting)
+- optional `channelId` (must match this connection's active channel/thread)
 - source by local `path`
 - or source by `url`
 - or source by `base64` (+ optional `mediaType`)
@@ -103,6 +116,8 @@ Pi's TUI-only `ask_user_question` dialog (from `@juicesharp/rpiv-ask-user-questi
 1. **Blocks** the original `ask_user_question` via `tool_call` event interception — the TUI dialog never appears
 2. **Registers** `discord_ask_user_question` — a drop-in replacement that formats questions as Discord messages and collects answers from the channel
 3. **Hints** the LLM via `before_agent_start` to prefer `discord_ask_user_question` when Discord is connected
+
+Questions and custom-answer modals have unique per-question IDs; stale/foreign components cannot answer the current question. Plain-text `stop`, `cancel`, `停下`, `停止`, `取消`, or repeated `停` cancels the whole questionnaire rather than becoming an answer. Only the initiating user may answer when the question came from a Discord prompt.
 
 When Discord **is not** connected, the original `ask_user_question` (TUI dialog) works normally as a fallback. No need to uninstall `@juicesharp/rpiv-ask-user-question` — the two extensions coexist gracefully.
 
