@@ -18,7 +18,7 @@
  *   /rc status  — show connection state
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   Client,
@@ -47,6 +47,7 @@ import { ConnectionStore, type Connection } from "./connections.js";
 import type { Config } from "./config.js";
 import {
   makeChannelName,
+  sessionLabel,
   splitMessage,
   toolLabel,
   isAbortLikeError,
@@ -69,6 +70,7 @@ const MAPPED_CORE_COMMANDS = [
   { name: "name", description: "Set the session display name" },
   { name: "session", description: "Show current session information" },
   { name: "new", description: "Start a new session" },
+  { name: "resume", description: "Choose a saved session and transfer remote control to it" },
   { name: "fork", description: "Choose a user message to fork from" },
   { name: "clone", description: "Clone the current session position" },
   { name: "tree", description: "Navigate to a session entry ID" },
@@ -81,7 +83,8 @@ const MAPPED_CORE_COMMANDS = [
 // the old gateway is closed before the new runtime starts.
 const reloadKey = Symbol.for("pi-remote.reload");
 type ReloadState = { config: Config | null; cwd: string; enabled: boolean; connected: boolean;
-  previousFile?: string; nextChannelId?: string; previousChannelId?: string; recovery?: boolean };
+  previousFile?: string; nextChannelId?: string; previousChannelId?: string; recovery?: boolean;
+  remoteResume?: boolean; preparedDestination?: boolean };
 const reloadSlot = globalThis as typeof globalThis & { [reloadKey]?: ReloadState };
 const outcomeKey = Symbol.for("pi-remote.transition-outcome");
 const outcomeSlot = globalThis as typeof globalThis & { [outcomeKey]?: { ok: boolean; channelId?: string; error?: string } };
@@ -100,6 +103,8 @@ export default function (pi: ExtensionAPI) {
   const runtime: RuntimeState = { activeChannelId: null, sessionChannelName: null };
   let activeModelRegistry: any = null;
   let activeSessionManager: any = null;
+  let activeCwd = "";
+  let resumeTarget: { id: string; path: string } | undefined;
   let currentSessionId: string | null = null;
   let pendingNextChannelId: string | null = null;
   const connections = new ConnectionStore();
@@ -124,14 +129,20 @@ export default function (pi: ExtensionAPI) {
     if (orphan) await orphan.delete("Session transition cancelled").catch(() => {});
   }
 
-  async function prepareReplacement(ctx: any, forkEntry?: string): Promise<{ cancel: true } | undefined> {
+  async function prepareReplacement(ctx: any, forkEntry?: string, resumeSessionId?: string): Promise<{ cancel: true } | undefined> {
     if (forceRecovery) return;
     if (connection) await maintainConnection();
     if (agentBusy || questionResolver || transitionPending || rcCommandRunning) {
       ctx.ui.notify("Cannot switch sessions while remote work or another transition is active.", "warning");
       return { cancel: true };
     }
-    if (!client?.isReady() || remotelyPaused) return;
+    if (!client?.isReady() || remotelyPaused) {
+      if (resumeSessionId) {
+        ctx.ui.notify("Original connection is no longer available; resume cancelled.", "error");
+        return { cancel: true };
+      }
+      return;
+    }
     if (!ctx.sessionManager.getSessionFile() || !existsSync(ctx.sessionManager.getSessionFile())) {
       ctx.ui.notify("Save the original session before switching so rollback is possible.", "error");
       return { cancel: true };
@@ -139,6 +150,17 @@ export default function (pi: ExtensionAPI) {
     transitionPending = true;
     try {
       if (!await maintainConnection(true)) throw new Error("Original connection is unavailable.");
+      if (resumeSessionId) {
+        const target = await connections.get(resumeSessionId);
+        if (target?.owner) throw new Error("Target session is already connected in another Pi runtime.");
+        if (target?.channelId) {
+          const channel = await client!.channels.fetch(target.channelId);
+          if (!channel?.isTextBased() || !("guildId" in channel) || channel.guildId !== activeConfig!.guildId) {
+            throw new Error("Target session's bound channel is missing or inaccessible.");
+          }
+          pendingNextChannelId = target.channelId;
+        }
+      }
       if (forkEntry) {
         const currentChannel = await client!.channels.fetch(runtime.activeChannelId!);
         if (currentChannel && !currentChannel.isThread()) {
@@ -148,12 +170,12 @@ export default function (pi: ExtensionAPI) {
           }
         }
       }
-      if (!preparedChannel) {
+      if (!preparedChannel && !pendingNextChannelId) {
         const guild = await client!.guilds.fetch(activeConfig!.guildId);
         preparedChannel = await guild.channels.create({ name: makeChannelName(ctx.cwd), type: ChannelType.GuildText,
           ...(activeConfig!.categoryId ? { parent: activeConfig!.categoryId } : {}), topic: "Pi session transition (preparing)" });
       }
-      pendingNextChannelId = preparedChannel.id;
+      if (preparedChannel) pendingNextChannelId = preparedChannel.id;
       // Other extensions can veto after us. Reclaim preparation if shutdown never follows.
       preparationTimer = setTimeout(() => { void discardPreparation(); }, 60_000);
       preparationTimer.unref();
@@ -226,7 +248,7 @@ export default function (pi: ExtensionAPI) {
   const discordEntryType = "pi-remote-discord-source";
   type ForkMenu = { userId: string; channelId: string; sessionId: string; entries: Array<{ id: string; text: string }>; page: number; created: number };
   const forkMenus = new Map<string, ForkMenu>();
-  type ChoiceMenu = { userId: string; channelId: string; sessionId: string; kind: "model" | "thinking";
+  type ChoiceMenu = { userId: string; channelId: string; sessionId: string; kind: "model" | "thinking" | "resume";
     entries: Array<{ label: string; value: string }>; page: number; created: number };
   const choiceMenus = new Map<string, ChoiceMenu>();
   const handledInteractions = new Map<string, number>();
@@ -241,7 +263,7 @@ export default function (pi: ExtensionAPI) {
     if (menu.page + 1 < pages) options.push({ label: "➡️ Next page", value: "__next__" });
     options.push({ label: "Cancel", value: "__cancel__" });
     return {
-      content: `Choose a ${menu.kind === "model" ? "model" : "thinking level"} (page ${menu.page + 1}/${pages}).`,
+      content: `Choose a ${menu.kind === "model" ? "model" : menu.kind === "resume" ? "session to resume" : "thinking level"} (page ${menu.page + 1}/${pages}).`,
       components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
         new StringSelectMenuBuilder().setCustomId(`pi-choice:${token}`).setPlaceholder(`Select ${menu.kind}`).addOptions(options),
       )],
@@ -900,7 +922,7 @@ export default function (pi: ExtensionAPI) {
             return;
           }
           choiceMenus.delete(token);
-          await interaction.update({ content: `Setting ${menu.kind} to ${selected.label}…`, components: [] });
+          await interaction.update({ content: menu.kind === "resume" ? `Resuming ${selected.label}…` : `Setting ${menu.kind} to ${selected.label}…`, components: [] });
           sendCoreCommand(menu.kind, selected.value, interaction.channelId, interaction.user.id);
         }
         return;
@@ -996,6 +1018,24 @@ export default function (pi: ExtensionAPI) {
         else if (coreCommand === "tree") coreArgs = interaction.options.getString("entry", true);
         if (agentBusy && coreCommand !== "abort") {
           await interaction.reply({ content: "⏳ Pi is processing. Only /abort can run right now.", ephemeral: true });
+          return;
+        }
+        if (coreCommand === "resume") {
+          await interaction.deferReply({ ephemeral: true });
+          const sessions = await SessionManager.list(activeCwd, activeSessionManager.getSessionDir());
+          const entries = sessions.filter(session => session.id !== currentSessionId)
+            .sort((a, b) => b.modified.getTime() - a.modified.getTime())
+            .map(session => ({ label: sessionLabel(session.name, session.firstMessage, session.id), value: session.path }));
+          if (!entries.length) {
+            await interaction.editReply({ content: "No other saved sessions in this working directory." });
+            return;
+          }
+          for (const [key, menu] of choiceMenus) if (Date.now() - menu.created > 10 * 60_000) choiceMenus.delete(key);
+          const token = randomUUID();
+          const menu: ChoiceMenu = { userId: interaction.user.id, channelId: interaction.channelId,
+            sessionId: currentSessionId!, kind: "resume", entries, page: 0, created: Date.now() };
+          choiceMenus.set(token, menu);
+          await interaction.editReply({ ...choiceMenuView(menu, token) });
           return;
         }
         if (coreCommand === "model" || coreCommand === "thinking") {
@@ -1157,6 +1197,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_before_switch", async (event: any, ctx: any) => {
     try {
       if (event.reason === "new") return await prepareReplacement(ctx);
+      if (event.reason === "resume" && resumeTarget && !forceRecovery) return await prepareReplacement(ctx, undefined, resumeTarget.id);
       if (!forceRecovery && (agentBusy || questionResolver || rcCommandRunning || transitionPending)) return { cancel: true };
     } catch (error) {
       ctx.ui.notify(`Cannot safely switch remote session: ${String(error)}`, "error");
@@ -1174,6 +1215,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (event: any, ctx: any) => {
     activeModelRegistry = ctx.modelRegistry;
     activeSessionManager = ctx.sessionManager;
+    activeCwd = ctx.cwd;
     currentSessionId = ctx.sessionManager.getSessionId();
     connectNotify = (msg, level) => ctx.ui.notify(msg, level);
     connectSetStatus = (key, val) => ctx.ui.setStatus(key, val);
@@ -1183,20 +1225,29 @@ export default function (pi: ExtensionAPI) {
     connection = await connections.get(currentSessionId!);
     if (!saved || event.reason === "startup") return;
     const creating = event.reason === "new" || event.reason === "fork";
+    const resuming = event.reason === "resume" && saved.remoteResume && !saved.recovery;
+    let allocated = false;
     outcomeSlot[outcomeKey] = { ok: false };
     try {
-      if (creating && saved.enabled) connection = await connections.enable(currentSessionId!);
-      // Resume/startup never carry the flame, except explicit rollback to S1.
-      const reconnect = (creating || event.reason === "reload" || saved.recovery) && saved.connected;
+      if ((creating || resuming) && saved.enabled && !connection) {
+        const allocation = await connections.allocate(currentSessionId!);
+        connection = allocation.connection;
+        allocated = allocation.created;
+      }
+      // Terminal resume/startup stay disconnected. Discord resume and rollback carry the flame.
+      const reconnect = (creating || resuming || event.reason === "reload" || saved.recovery) && saved.connected;
       if (reconnect && saved.config) {
         await startClient(saved.config, ctx.cwd, connectNotify, connectSetStatus, saved.nextChannelId);
       }
       outcomeSlot[outcomeKey] = { ok: true, channelId: runtime.activeChannelId ?? undefined };
     } catch (error) {
       outcomeSlot[outcomeKey] = { ok: false, error: String(error) };
-      if (creating) {
-        await disableRemote().catch(() => {});
-        if (saved.nextChannelId && saved.config) {
+      if (creating || resuming) {
+        const retainedChannel = connection?.channelId;
+        if (allocated) await disableRemote().catch(() => {});
+        else await disconnectRemote().catch(() => {});
+        if (saved.preparedDestination && saved.nextChannelId && saved.config &&
+          (allocated || retainedChannel !== saved.nextChannelId)) {
           await new REST({ version: "10" }).setToken(saved.config.token)
             .delete(Routes.channel(saved.nextChannelId)).catch(() => {});
         }
@@ -1257,7 +1308,8 @@ export default function (pi: ExtensionAPI) {
         reloadSlot[reloadKey] = { config: activeConfig, cwd: ctx.cwd,
           enabled: !!connection, connected: !!client?.isReady() && !remotelyPaused,
           previousFile: ctx.sessionManager.getSessionFile(), previousChannelId: runtime.activeChannelId ?? undefined,
-          nextChannelId: pendingNextChannelId ?? undefined };
+          nextChannelId: pendingNextChannelId ?? undefined, remoteResume: !!resumeTarget,
+          preparedDestination: !!preparedChannel };
       }
     } finally {
       await disconnectRemote();
@@ -1823,6 +1875,31 @@ export default function (pi: ExtensionAPI) {
               `Model: ${model ? `${model.provider}/${model.id}` : "(none)"}`,
               `Thinking: ${ctx.thinkingLevel ?? pi.getThinkingLevel()}`,
             ].join("\n");
+            break;
+          }
+          case "resume": {
+            const sessions = await SessionManager.list(ctx.cwd, ctx.sessionManager.getSessionDir());
+            const target = sessions.find(session => session.path === args && session.id !== currentSessionId);
+            if (!target) throw new Error("Selected session is unavailable or is already the current session. Run /resume again.");
+            if (!client?.isReady() || remotelyPaused) throw new Error("Resume from Discord requires a connected source session.");
+            resumeTarget = { id: target.id, path: target.path };
+            try {
+              const outcome = await ctx.switchSession(target.path);
+              if (!outcome.cancelled) {
+                const next = outcomeSlot[outcomeKey];
+                await replyAfterReplacement(next?.ok ? `✅ Resumed ${target.name || target.id}. Continue in <#${next.channelId}>.`
+                  : "❌ Resume connection failed; restoring the original session.");
+                return;
+              }
+              await discardPreparation();
+              result = "Resume cancelled; original session retained.";
+            } catch (error) {
+              await discardPreparation();
+              await replyAfterReplacement(`❌ Resume failed: ${String(error)}. If Pi could not create a replacement runtime, resume the original session from the terminal.`);
+              return;
+            } finally {
+              resumeTarget = undefined;
+            }
             break;
           }
           case "new": {

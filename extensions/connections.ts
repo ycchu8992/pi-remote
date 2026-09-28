@@ -79,12 +79,18 @@ export class ConnectionStore {
   }
 
   async enable(sessionId: string): Promise<Connection> {
+    return (await this.allocate(sessionId)).connection;
+  }
+
+  /** Creation status is decided under the same lock, so rollback never destroys
+   * a resource concurrently allocated by a different runtime. */
+  async allocate(sessionId: string): Promise<{ connection: Connection; created: boolean }> {
     return this.transaction((db, now) => {
       const existing = db.connections.find(c => c.sessionId === sessionId && c.destroyedAt === undefined);
-      if (existing) return existing;
+      if (existing) return { connection: existing, created: false };
       const c: Connection = { id: randomUUID(), sessionId, createdAt: now, lastUsedAt: now, expiresAt: now + CONNECTION_TTL };
       db.connections.push(c);
-      return c;
+      return { connection: c, created: true };
     });
   }
 

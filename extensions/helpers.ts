@@ -21,6 +21,13 @@ export function makeChannelName(cwd: string): string {
     .slice(0, 100);
 }
 
+/** One display label shared by the resume picker and Discord destinations. */
+export function sessionLabel(name: string | undefined, firstMessage: string | undefined, sessionId: string): string {
+  const title = (name?.trim() || firstMessage?.trim() || "Unnamed session").replace(/\s+/g, " ");
+  const suffix = ` · ${sessionId.slice(0, 8)}`;
+  return title.slice(0, 100 - suffix.length) + suffix;
+}
+
 /** Count how many unmatched ``` fences precede a position in the text. */
 function countOpenFences(text: string): number {
   let count = 0;
