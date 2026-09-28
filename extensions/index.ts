@@ -427,14 +427,16 @@ export default function (pi: ExtensionAPI) {
 
   // ── Shared send helpers ──────────────────────────────────────────────────
 
-  async function sendToChannel(channelId: string, text: string, suppressMentions = false, allowedUserId?: string): Promise<string | undefined> {
+  async function sendToChannel(channelId: string, text: string, suppressMentions = false, allowedUserId?: string,
+    attachment?: { data: Buffer; name: string }): Promise<string | undefined> {
     if (!client || remotelyPaused || transitionPending || channelId !== runtime.activeChannelId) return;
     if (!await maintainConnection()) return;
     try {
       const channel = (await client!.channels.fetch(channelId)) as TextChannel | null;
       if (!channel?.isTextBased()) return;
-      const sent = await (channel as TextChannel).send(suppressMentions
-        ? { content: text, allowedMentions: { parse: [], users: allowedUserId ? [allowedUserId] : [] } } : text);
+      const sent = await (channel as TextChannel).send(suppressMentions || attachment
+        ? { content: text, allowedMentions: { parse: [], users: allowedUserId ? [allowedUserId] : [] },
+            ...(attachment ? { files: [{ attachment: attachment.data, name: attachment.name }] } : {}) } : text);
       await maintainConnection(true);
       return sent.id;
     } catch (err) {
@@ -813,6 +815,33 @@ export default function (pi: ExtensionAPI) {
       const text = assistantText(event.message);
       acceptAssistantText(text, true);
       if (text.trim()) collectedAssistantText.push(text);
+    }
+  });
+
+  // Compaction is a session event, not an assistant reply: it can complete
+  // after agent_end or be initiated directly from the terminal/Discord.
+  pi.on("session_compact", async (event) => {
+    const channelId = runtime.activeChannelId;
+    if (!channelId || !client?.isReady() || remotelyPaused) return;
+    await replySendQueue;
+    const summary = event.compactionEntry.summary;
+    const id = await sendToChannel(channelId, `🗜️ Context compacted (${event.reason}). Summary attached.`, true, undefined,
+      { data: Buffer.from(summary, "utf8"), name: "pi-compaction.txt" });
+    if (!id) {
+      console.error("[pi-remote] Failed to deliver compaction summary attachment to Discord.");
+      await sendToChannel(channelId, "❌ Could not upload the compaction summary. It remains in the Pi session.", true);
+    }
+  });
+
+  pi.on("session_compact_failed", async (event) => {
+    const channelId = runtime.activeChannelId;
+    if (!channelId || !client?.isReady() || remotelyPaused) return;
+    await replySendQueue;
+    const text = event.aborted
+      ? `🛑 Context compaction cancelled (${event.reason}).`
+      : `❌ Context compaction failed (${event.reason}): ${event.errorMessage ?? "Unknown error"}`;
+    for (const chunk of splitMessage(text, 1800)) {
+      if (!await sendToChannel(channelId, chunk, true)) break;
     }
   });
 
