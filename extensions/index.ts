@@ -254,6 +254,8 @@ export default function (pi: ExtensionAPI) {
     clearReconnectTimer();
     questionRejecter?.(new Error("Remote connection disconnected"));
     clearQuestionState();
+    steeringQueued = false;
+    replyGeneration++;
     const oldClient = client;
     client = null;
     runtime.activeChannelId = null;
@@ -368,9 +370,16 @@ export default function (pi: ExtensionAPI) {
   }
 
   let agentBusy = false;
+  let steeringQueued = false;
   let pendingReplyChannelId: string | null = null;
   let pendingReplyUserId: string | null = null;
   let collectedAssistantText: string[] = [];
+  let assistantLineText = "";
+  let assistantLineOffset = 0;
+  let replySendQueue: Promise<void> = Promise.resolve();
+  let replySendFailed = false;
+  let replyGeneration = 0;
+  let replyMentionSent = false;
   let postedThinkingNotice = false;
   let lastImageArtifactPath: string | null = null;
 
@@ -418,13 +427,14 @@ export default function (pi: ExtensionAPI) {
 
   // ── Shared send helpers ──────────────────────────────────────────────────
 
-  async function sendToChannel(channelId: string, text: string): Promise<string | undefined> {
+  async function sendToChannel(channelId: string, text: string, suppressMentions = false, allowedUserId?: string): Promise<string | undefined> {
     if (!client || remotelyPaused || transitionPending || channelId !== runtime.activeChannelId) return;
     if (!await maintainConnection()) return;
     try {
       const channel = (await client!.channels.fetch(channelId)) as TextChannel | null;
       if (!channel?.isTextBased()) return;
-      const sent = await (channel as TextChannel).send(text);
+      const sent = await (channel as TextChannel).send(suppressMentions
+        ? { content: text, allowedMentions: { parse: [], users: allowedUserId ? [allowedUserId] : [] } } : text);
       await maintainConnection(true);
       return sent.id;
     } catch (err) {
@@ -664,8 +674,20 @@ export default function (pi: ExtensionAPI) {
     agentBusy = true;
     await maintainConnection();
     collectedAssistantText = [];
+    assistantLineText = "";
+    assistantLineOffset = 0;
+    replyGeneration++;
+    replySendQueue = Promise.resolve();
+    replySendFailed = false;
     postedThinkingNotice = false;
     lastImageArtifactPath = null;
+  });
+
+  pi.on("message_start", async (event) => {
+    if (event.message.role === "assistant") {
+      assistantLineText = "";
+      assistantLineOffset = 0;
+    }
   });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -709,16 +731,58 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function assistantText(message: any): string {
+    return (message.content as Array<{ type: string; text?: string }>)
+      .filter(part => part.type === "text" && typeof part.text === "string")
+      .map(part => part.text!).join("");
+  }
+
+  // Preserve Discord creation order: send each completed line once, never edit
+  // an older reply after a new thinking/tool message has appeared below it.
+  function queueReplyLine(line: string): void {
+    if (!line.trim() || !pendingReplyChannelId) return;
+    const channelId = pendingReplyChannelId;
+    const userId = pendingReplyUserId;
+    const generation = replyGeneration;
+    replySendQueue = replySendQueue.then(async () => {
+      if (replySendFailed || generation !== replyGeneration) return;
+      const chunks = [...line.matchAll(/[\s\S]{1,1700}/gu)].map(match => match[0]);
+      for (const chunk of chunks) {
+        const first = !replyMentionSent;
+        const mention = first && userId ? `<@${userId}> ` : "";
+        const id = await sendToChannel(channelId, mention + chunk, true, first ? userId ?? undefined : undefined);
+        if (!id) { replySendFailed = true; return; }
+        replyMentionSent = true;
+      }
+    }).catch(error => {
+      replySendFailed = true;
+      console.error("[pi-remote] Failed to send reply line:", error);
+    });
+  }
+
+  function acceptAssistantText(text: string, final = false): void {
+    // Pi reports cumulative text for the current assistant message.
+    if (!text.startsWith(assistantLineText)) assistantLineOffset = 0;
+    assistantLineText = text;
+    let end: number;
+    while ((end = text.indexOf("\n", assistantLineOffset)) !== -1) {
+      queueReplyLine(text.slice(assistantLineOffset, end));
+      assistantLineOffset = end + 1;
+    }
+    if (final) {
+      queueReplyLine(text.slice(assistantLineOffset));
+      assistantLineOffset = text.length;
+    }
+  }
+
   pi.on("message_update", async (event: any) => {
-    if (!pendingReplyChannelId || postedThinkingNotice) return;
-    if (event.message.role !== "assistant") return;
-    const hasThinking = (event.message.content as Array<{ type: string }>)
-      .some((c) => c.type === "thinking");
-    if (hasThinking) {
+    if (event.message.role !== "assistant" || !pendingReplyChannelId) return;
+    if (!postedThinkingNotice && (event.message.content as Array<{ type: string }>).some(part => part.type === "thinking")) {
       postedThinkingNotice = true;
+      await replySendQueue;
       await sendToActiveChannel("> 💭 _Thinking…_");
     }
+    acceptAssistantText(assistantText(event.message));
   });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -745,15 +809,9 @@ export default function (pi: ExtensionAPI) {
     }
     if (!pendingReplyChannelId) return;
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const content = event.message.content as Array<any>;
-
-    // Collect text from assistant messages
     if (event.message.role === "assistant") {
-      const text = content
-        .filter((c) => c.type === "text" && typeof c.text === "string")
-        .map((c) => c.text as string)
-        .join("");
+      const text = assistantText(event.message);
+      acceptAssistantText(text, true);
       if (text.trim()) collectedAssistantText.push(text);
     }
   });
@@ -773,38 +831,56 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (!pendingReplyChannelId || !client) {
-      pendingReplyChannelId = null;
+      if (!steeringQueued) pendingReplyChannelId = null;
       collectedAssistantText = [];
       return;
     }
 
+    // Flush any tail even if a provider omitted message_end; wait for every
+    // queued line before clearing the reply destination.
+    acceptAssistantText(assistantLineText, true);
+    await replySendQueue;
     const text = collectedAssistantText.join("\n\n").trim();
-    // Clear state before sending so sendToActiveChannel still sees the channel ID
+    if (replySendFailed && text) {
+      const channelId = pendingReplyChannelId;
+      const fallback = [...text.matchAll(/[\s\S]{1,1700}/gu)].map(match => match[0]);
+      let sentAll = true;
+      for (const [index, chunk] of fallback.entries()) {
+        const id = await sendToChannel(channelId, `${index === 0 ? "⚠️ 完整回覆（傳送失敗）：\n" : ""}${chunk}`, true);
+        if (!id) { sentAll = false; break; }
+      }
+      if (!sentAll) connectNotify?.("Discord reply could not be delivered. The complete answer remains in the Pi terminal.", "error");
+    }
     collectedAssistantText = [];
-    // pendingReplyChannelId cleared after send below
+    assistantLineText = "";
+    assistantLineOffset = 0;
 
     if (!text) {
-      pendingReplyChannelId = null;
-      pendingReplyUserId = null;
+      if (!steeringQueued) {
+        pendingReplyChannelId = null;
+        pendingReplyUserId = null;
+      }
       return;
     }
 
-    const chunks = splitMessage(text);
-    // Prepend a mention to the last chunk so the sender is notified when work is done
-    const mention = pendingReplyUserId ? `<@${pendingReplyUserId}> ` : "";
-    const lastIdx = chunks.length - 1;
-    chunks[lastIdx] = mention + chunks[lastIdx];
-
-    for (const chunk of chunks) {
-      await sendToActiveChannel(chunk);
+    if (!steeringQueued) {
+      pendingReplyChannelId = null;
+      pendingReplyUserId = null;
     }
-    pendingReplyChannelId = null;
-    pendingReplyUserId = null;
     } finally {
       agentBusy = false;
       await syncChannelName();
       await maintainConnection();
     }
+  });
+
+  // Steering can continue after agent_end; only agent_settled means Pi has no
+  // queued work left. Keep the response channel across those low-level runs.
+  pi.on("agent_settled", async () => {
+    replyMentionSent = false;
+    steeringQueued = false;
+    pendingReplyChannelId = null;
+    pendingReplyUserId = null;
   });
 
   // ── Reconnect logic ────────────────────────────────────────────────────────
@@ -1309,21 +1385,21 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      if (agentBusy) {
-        await message.reply("⏳ Still processing the previous message — please wait.").catch(() => {});
-        return;
-      }
-
+      // A second Enter in Pi's terminal steers the running agent. Forward busy
+      // Discord prompts the same way; Pi owns the steering queue and its mode.
+      const steering = agentBusy;
       if (activeConfig.reactions !== false) {
         await message.react("⏳").catch(() => {});
       }
 
       await maintainConnection(true);
-      pendingSource = { messageId: message.id, channelId: message.channelId,
-        entryCount: activeSessionManager?.getEntries().length ?? 0, text: "" };
-      pendingReplyChannelId = message.channelId;
-      pendingReplyUserId = message.author.id;
-      collectedAssistantText = [];
+      if (!steering) {
+        pendingSource = { messageId: message.id, channelId: message.channelId,
+          entryCount: activeSessionManager?.getEntries().length ?? 0, text: "" };
+        pendingReplyChannelId = message.channelId;
+        pendingReplyUserId = message.author.id;
+        collectedAssistantText = [];
+      }
       try {
         const parts: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
         const files: string[] = [];
@@ -1361,12 +1437,15 @@ export default function (pi: ExtensionAPI) {
         parts.unshift({ type: "text", text: prompt || "Please inspect the attached image(s)." });
         if (pendingSource?.messageId === message.id) pendingSource.text = prompt || "Please inspect the attached image(s).";
         if (isShuttingDown || remotelyPaused || transitionPending || message.channelId !== runtime.activeChannelId || !await maintainConnection()) return;
-        pi.sendUserMessage(parts);
+        pi.sendUserMessage(parts, steering ? { deliverAs: "steer" } : undefined);
+        if (steering) steeringQueued = true;
       } catch (err: any) {
-        pendingReplyChannelId = null;
-        pendingReplyUserId = null;
-        pendingSource = null;
-        await message.reply(`❌ Attachment failed: ${String(err?.message ?? err)}`).catch(() => {});
+        if (!steering) {
+          pendingReplyChannelId = null;
+          pendingReplyUserId = null;
+          pendingSource = null;
+        }
+        await message.reply(`❌ Message failed: ${String(err?.message ?? err)}`).catch(() => {});
       }
     };
   }

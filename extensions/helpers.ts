@@ -1,5 +1,5 @@
 /**
- * Shared helpers for pi-discord-remote.
+ * Shared helpers for pi-remote.
  */
 
 import { basename } from "node:path";
