@@ -7,7 +7,7 @@ import { CONFIG_DIR } from "./config.js";
 const require = createRequire(import.meta.url);
 const lockfile = require("proper-lockfile") as { lock(path: string, options: object): Promise<() => Promise<void>> };
 export const CONNECTION_TTL = 24 * 60 * 60 * 1000;
-export const LEASE_TTL = 60_000;
+export const CONNECTION_LOCK_TTL = 60_000;
 export interface Connection {
   id: string;
   sessionId: string;
@@ -16,13 +16,13 @@ export interface Connection {
   lastUsedAt: number;
   expiresAt: number;
   destroyedAt?: number;
-  owner?: { id: string; until: number; busy: boolean };
+  lock?: { id: string; until: number; busy: boolean };
 }
-interface Registry { version: 1; connections: Connection[]; retiredChannels: string[] }
+interface Registry { version: 2; connections: Connection[]; retiredChannels: string[] }
 
-/** Non-secret registry. All read/modify/write operations use a cross-process lock.
- * Destroyed bindings are tombstones: a channel can never be assigned again.
- * A lease fences duplicate runtimes; a live busy lease temporarily defers expiry.
+/** Session bindings are permanent; a timed connection lock excludes duplicate runtimes.
+ * The separate short-lived file lock only serializes registry transactions.
+ * A valid connection lock with busy work temporarily defers resource expiry.
  */
 export class ConnectionStore {
   constructor(readonly path = join(CONFIG_DIR, "connections.json"), private now = Date.now) {}
@@ -36,32 +36,33 @@ export class ConnectionStore {
     const temp = `${this.path}.${randomUUID()}.tmp`;
     try {
       let db: Registry;
-      try { db = JSON.parse(await readFile(this.path, "utf8")); }
-      catch (error: any) {
+      try {
+        db = JSON.parse(await readFile(this.path, "utf8"));
+      } catch (error: any) {
         if (error.code !== "ENOENT") throw error;
-        db = { version: 1, connections: [], retiredChannels: [] };
+        db = { version: 2, connections: [], retiredChannels: [] };
       }
-      if (db?.version !== 1 || !Array.isArray(db.connections) || !Array.isArray(db.retiredChannels) ||
+      if (db?.version !== 2 || !Array.isArray(db.connections) || !Array.isArray(db.retiredChannels) ||
         db.retiredChannels.some(id => typeof id !== "string") || db.connections.some(c =>
           !c || typeof c.id !== "string" || typeof c.sessionId !== "string" ||
           ![c.createdAt, c.lastUsedAt, c.expiresAt].every(Number.isFinite) ||
           (c.channelId !== undefined && typeof c.channelId !== "string") ||
           (c.destroyedAt !== undefined && !Number.isFinite(c.destroyedAt)) ||
-          (c.owner !== undefined && (!c.owner || typeof c.owner.id !== "string" || !Number.isFinite(c.owner.until) || typeof c.owner.busy !== "boolean")))) {
+          (c.lock !== undefined && (!c.lock || typeof c.lock.id !== "string" || !Number.isFinite(c.lock.until) || typeof c.lock.busy !== "boolean")))) {
         throw new Error("Invalid connection registry; refusing to overwrite it.");
       }
       const ids = db.connections.map(c => c.id);
       const channels = db.connections.flatMap(c => c.channelId ? [c.channelId] : []);
       const sessions = db.connections.filter(c => c.destroyedAt === undefined).map(c => c.sessionId);
       if (new Set(ids).size !== ids.length || new Set(channels).size !== channels.length || new Set(sessions).size !== sessions.length) {
-        throw new Error("Conflicting connection ownership in registry; refusing to route events.");
+        throw new Error("Conflicting connection bindings in registry; refusing to route events.");
       }
       const now = this.now();
       for (const c of db.connections) {
-        if (c.owner && c.owner.until <= now) delete c.owner;
-        if (c.destroyedAt === undefined && c.expiresAt <= now && !c.owner?.busy) {
+        if (c.lock && c.lock.until <= now) delete c.lock;
+        if (c.destroyedAt === undefined && c.expiresAt <= now && !c.lock?.busy) {
           c.destroyedAt = now;
-          delete c.owner;
+          delete c.lock;
         }
       }
       const result = fn(db, now);
@@ -82,7 +83,7 @@ export class ConnectionStore {
     return (await this.allocate(sessionId)).connection;
   }
 
-  /** Creation status is decided under the same lock, so rollback never destroys
+  /** Creation status is decided under the file lock, so rollback never destroys
    * a resource concurrently allocated by a different runtime. */
   async allocate(sessionId: string): Promise<{ connection: Connection; created: boolean }> {
     return this.transaction((db, now) => {
@@ -100,36 +101,37 @@ export class ConnectionStore {
     });
   }
 
-  async claim(sessionId: string, id: string, owner: string): Promise<Connection> {
+  async acquireLock(sessionId: string, id: string, runtimeId: string): Promise<Connection> {
     return this.transaction((db, now) => {
       const c = this.require(db, sessionId, id);
-      if (c.owner && c.owner.id !== owner) throw new Error("This session's connection is owned by another Pi runtime.");
-      c.owner = { id: owner, until: now + LEASE_TTL, busy: false };
+      if (c.lock && c.lock.id !== runtimeId) throw new Error("This session's connection is locked by another Pi runtime. Disconnect it there, or retry after its lock expires if it has stopped.");
+      c.lock = { id: runtimeId, until: now + CONNECTION_LOCK_TTL, busy: false };
       return c;
     });
   }
 
-  async heartbeat(sessionId: string, id: string, owner: string, busy: boolean): Promise<Connection> {
+  /** Report local runtime liveness; this does not verify Discord connectivity or refresh activity. */
+  async reportLiveness(sessionId: string, id: string, runtimeId: string, busy: boolean): Promise<Connection> {
     return this.transaction((db, now) => {
-      const c = this.requireOwned(db, sessionId, id, owner);
-      c.owner = { id: owner, until: now + LEASE_TTL, busy };
+      const c = this.requireLock(db, sessionId, id, runtimeId);
+      c.lock = { id: runtimeId, until: now + CONNECTION_LOCK_TTL, busy };
       return c;
     });
   }
 
-  async touch(sessionId: string, id: string, owner: string): Promise<Connection> {
+  async touch(sessionId: string, id: string, runtimeId: string): Promise<Connection> {
     return this.transaction((db, now) => {
-      const c = this.requireOwned(db, sessionId, id, owner);
+      const c = this.requireLock(db, sessionId, id, runtimeId);
       c.lastUsedAt = now;
       c.expiresAt = now + CONNECTION_TTL;
-      c.owner!.until = now + LEASE_TTL;
+      c.lock!.until = now + CONNECTION_LOCK_TTL;
       return c;
     });
   }
 
-  async bind(sessionId: string, id: string, owner: string, channelId: string): Promise<Connection> {
+  async bind(sessionId: string, id: string, runtimeId: string, channelId: string): Promise<Connection> {
     return this.transaction(db => {
-      const c = this.requireOwned(db, sessionId, id, owner);
+      const c = this.requireLock(db, sessionId, id, runtimeId);
       if (c.channelId === channelId) return c;
       if (c.channelId) throw new Error("A connection cannot change its channel.");
       if (db.retiredChannels.includes(channelId) || db.connections.some(other => other.channelId === channelId)) {
@@ -140,20 +142,20 @@ export class ConnectionStore {
     });
   }
 
-  async disconnect(sessionId: string, id: string, owner: string): Promise<void> {
+  async disconnect(sessionId: string, id: string, runtimeId: string): Promise<void> {
     await this.transaction(db => {
       const c = db.connections.find(c => c.sessionId === sessionId && c.id === id);
-      if (c?.owner?.id === owner) delete c.owner;
+      if (c?.lock?.id === runtimeId) delete c.lock;
     });
   }
 
-  async destroy(sessionId: string, id: string, owner: string): Promise<void> {
+  async destroy(sessionId: string, id: string, runtimeId: string): Promise<void> {
     await this.transaction((db, now) => {
       const c = db.connections.find(c => c.sessionId === sessionId && c.id === id);
       if (!c || c.destroyedAt !== undefined) return;
-      if (c.owner && c.owner.id !== owner) throw new Error("Connection is owned by another Pi runtime.");
+      if (c.lock && c.lock.id !== runtimeId) throw new Error("Connection is locked by another Pi runtime.");
       c.destroyedAt = now;
-      delete c.owner;
+      delete c.lock;
     });
   }
 
@@ -162,9 +164,9 @@ export class ConnectionStore {
     if (!c) throw new Error("Connection expired or disabled. Run /rc enable, then /rc connect.");
     return c;
   }
-  private requireOwned(db: Registry, sessionId: string, id: string, owner: string): Connection {
+  private requireLock(db: Registry, sessionId: string, id: string, runtimeId: string): Connection {
     const c = this.require(db, sessionId, id);
-    if (c.owner?.id !== owner) throw new Error("Connection ownership lost; reconnect from the Pi terminal.");
+    if (c.lock?.id !== runtimeId) throw new Error("Connection lock lost; reconnect from the Pi terminal.");
     return c;
   }
 }

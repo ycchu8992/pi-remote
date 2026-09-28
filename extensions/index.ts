@@ -146,7 +146,7 @@ export default function (pi: ExtensionAPI) {
   let currentSessionId: string | null = null;
   let pendingNextChannelId: string | null = null;
   const connections = new ConnectionStore();
-  const ownerId = randomUUID();
+  const runtimeId = randomUUID();
   let connection: Connection | undefined;
   let expiryTimer: ReturnType<typeof setInterval> | undefined;
   let maintenanceRunning = false;
@@ -190,7 +190,7 @@ export default function (pi: ExtensionAPI) {
       if (!await maintainConnection(true)) throw new Error("Original connection is unavailable.");
       if (resumeSessionId) {
         const target = await connections.get(resumeSessionId);
-        if (target?.owner) throw new Error("Target session is already connected in another Pi runtime.");
+        if (target?.lock) throw new Error("Target session is already connected in another Pi runtime.");
         if (target?.channelId) {
           const channel = await client!.channels.fetch(target.channelId);
           if (!channel?.isTextBased() || !("guildId" in channel) || channel.guildId !== activeConfig!.guildId) {
@@ -229,8 +229,8 @@ export default function (pi: ExtensionAPI) {
     if (!connection || !currentSessionId) return false;
     try {
       if (client) {
-        connection = await connections.heartbeat(currentSessionId, connection.id, ownerId, agentBusy || !!questionResolver || transitionPending);
-        if (activity) connection = await connections.touch(currentSessionId, connection.id, ownerId);
+        connection = await connections.reportLiveness(currentSessionId, connection.id, runtimeId, agentBusy || !!questionResolver || transitionPending);
+        if (activity) connection = await connections.touch(currentSessionId, connection.id, runtimeId);
       } else {
         connection = await connections.get(currentSessionId);
       }
@@ -264,12 +264,12 @@ export default function (pi: ExtensionAPI) {
     pendingReplyUserId = null;
     remotelyPaused = true;
     if (oldClient) await oldClient.destroy().catch(() => {});
-    if (connection && currentSessionId) await connections.disconnect(currentSessionId, connection.id, ownerId);
+    if (connection && currentSessionId) await connections.disconnect(currentSessionId, connection.id, runtimeId);
     connectSetStatus?.("pi-remote", undefined);
   }
 
   async function disableRemote(): Promise<void> {
-    if (connection && currentSessionId) await connections.destroy(currentSessionId, connection.id, ownerId);
+    if (connection && currentSessionId) await connections.destroy(currentSessionId, connection.id, runtimeId);
     await disconnectRemote();
     connection = undefined;
   }
@@ -1057,7 +1057,7 @@ export default function (pi: ExtensionAPI) {
 
   function buildInteractionHandler() {
     return async (interaction: any) => {
-      // Ownership precedes authorization and EVERY acknowledgement, including /rc.
+      // Connection lock validation precedes authorization and EVERY acknowledgement, including /rc.
       if (transitionPending || remotelyPaused || !client?.isReady() ||
         interaction.channelId !== runtime.activeChannelId || !await maintainConnection()) return;
       if (interaction.id) {
@@ -1253,7 +1253,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         if (remotelyPaused || !client?.isReady() || interaction.channelId !== runtime.activeChannelId) {
-          return; // Connection may have changed while awaiting ownership validation.
+          return; // Connection may have changed while awaiting connection lock validation.
         }
         const coreCommand = interaction.commandName;
         await maintainConnection(true);
@@ -1623,7 +1623,7 @@ export default function (pi: ExtensionAPI) {
     if (client) await disconnectRemote();
     connection = await connections.get(sessionId);
     if (!connection) throw new Error("Remote control is disabled. Run /rc enable first.");
-    connection = await connections.claim(sessionId, connection.id, ownerId);
+    connection = await connections.acquireLock(sessionId, connection.id, runtimeId);
     activeConfig = cfg;
     remotelyPaused = true; // Do not accept events until binding and registration succeed.
     isShuttingDown = false;
@@ -1693,7 +1693,7 @@ export default function (pi: ExtensionAPI) {
           });
           try {
             if (client !== c || isShuttingDown) throw new Error("Connection attempt cancelled");
-            connection = await connections.bind(sessionId, connection!.id, ownerId, newChannel.id);
+            connection = await connections.bind(sessionId, connection!.id, runtimeId, newChannel.id);
           } catch (error) {
             if (!candidateId) await newChannel.delete("Connection binding failed").catch(() => {});
             throw error;
@@ -1719,7 +1719,7 @@ export default function (pi: ExtensionAPI) {
           ] });
 
           if (client !== c || isShuttingDown) throw new Error("Connection attempt cancelled");
-          connection = await connections.touch(sessionId, connection!.id, ownerId);
+          connection = await connections.touch(sessionId, connection!.id, runtimeId);
           if (client !== c || isShuttingDown) throw new Error("Connection attempt cancelled");
           remotelyPaused = false;
           const label = `🔌 Discord: #${newChannel.name}`;
