@@ -1347,7 +1347,17 @@ export default function (pi: ExtensionAPI) {
             files.push(`${attachment.name}: ${path}`);
           }
         }
-        const prompt = [message.content, files.length ? `Attached files (local paths; use the read tool to inspect):\n${files.join("\n")}` : ""].filter(Boolean).join("\n\n");
+        let replyContext = "";
+        if (message.reference?.messageId) {
+          try {
+            const referenced = await withTimeout(message.fetchReference(), 10_000, "fetch_referenced_message");
+            const quotedText = referenced.content.trim() || (referenced.attachments.size ? "[message contains attachments]" : "[no text content]");
+            replyContext = `[Discord reply context — ${referenced.author.username} wrote:\n${quotedText.slice(0, 3000)}${quotedText.length > 3000 ? "…" : ""}]`;
+          } catch {
+            replyContext = "[Discord reply context: the referenced message could not be retrieved.]";
+          }
+        }
+        const prompt = [replyContext, message.content, files.length ? `Attached files (local paths; use the read tool to inspect):\n${files.join("\n")}` : ""].filter(Boolean).join("\n\n");
         parts.unshift({ type: "text", text: prompt || "Please inspect the attached image(s)." });
         if (pendingSource?.messageId === message.id) pendingSource.text = prompt || "Please inspect the attached image(s).";
         if (isShuttingDown || remotelyPaused || transitionPending || message.channelId !== runtime.activeChannelId || !await maintainConnection()) return;
