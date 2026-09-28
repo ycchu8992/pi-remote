@@ -91,7 +91,9 @@ The extension loads silently. Startup and the **terminal** `/resume` do not auto
 - **Routing** — foreign channels and unknown menu/question IDs are ignored before acknowledgement. Duplicate ownership of a resource is rejected. All participating Pi processes must run this version; legacy runtimes do not honor these leases.
 - **Incoming messages** — injected as prompts; bot reacts ⏳ and posts the response. `toolResponses` selects hidden/calls/calls+results as before.
 
-Discord exposes `/rc status`, `/rc disconnect`, `/rc disable`, and idempotent `/rc enable`/`connect` for already connected sessions. `/rc setup` is terminal-only. Core slash commands: `/model`, `/thinking`, `/name`, `/session`, `/new`, `/resume`, `/compact`, `/abort`, `/fork`, `/clone`, `/tree`, and `/reload`. Other extension/skill/TUI-only commands are not mapped.
+Discord exposes `/rc status`, `/rc disconnect`, `/rc disable`, and idempotent `/rc enable`/`connect` for already connected sessions. `/rc setup` is terminal-only. Core slash commands: `/model`, `/thinking`, `/name`, `/session`, `/new`, `/resume`, `/compact`, `/abort`, `/fork`, `/clone`, `/tree`, `/reload`, `/export`, and `/scoped-models`. Other extension/skill/TUI-only commands are not mapped.
+
+Discord `/export` saves an HTML file in the Pi working directory with the same default filename as terminal `/export`, then uploads **that same file** to the active Discord channel. The local file remains even if the upload fails. Custom output paths and JSONL export are available from the terminal only. The export may contain private data and is visible to users with access to that channel. `/scoped-models` opens a private, paginated Discord menu of available models. Select an item to toggle it, then **Save**; **Reset to all** clears the restriction when saved. The saved scope immediately filters the Discord `/model` picker; Pi's current session's own model-cycling scope still changes only for **new Pi sessions**. The menu is tied to its initiating user and session and expires after ten minutes.
 
 ### Upgrade from mapping-only versions
 

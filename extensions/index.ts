@@ -18,7 +18,7 @@
  *   /rc status  — show connection state
  */
 
-import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getPackageDir, SessionManager, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   Client,
@@ -27,6 +27,8 @@ import {
   Routes,
   SlashCommandBuilder,
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   StringSelectMenuBuilder,
   ModalBuilder,
   TextInputBuilder,
@@ -39,6 +41,7 @@ import {
 import { readFile, mkdtemp, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 
@@ -76,6 +79,8 @@ const MAPPED_CORE_COMMANDS = [
   { name: "clone", description: "Clone the current session position" },
   { name: "tree", description: "Navigate to a session entry ID" },
   { name: "reload", description: "Reload extensions and session resources" },
+  { name: "export", description: "Save session HTML locally and upload it to Discord" },
+  { name: "scoped-models", description: "Configure models for interactive cycling" },
 ] as const;
 
 // ─── Extension ────────────────────────────────────────────────────────────────
@@ -284,6 +289,9 @@ export default function (pi: ExtensionAPI) {
   type ChoiceMenu = { userId: string; channelId: string; sessionId: string; kind: "model" | "thinking" | "resume";
     entries: Array<{ label: string; value: string }>; page: number; created: number };
   const choiceMenus = new Map<string, ChoiceMenu>();
+  type ScopedMenu = { userId: string; channelId: string; sessionId: string; page: number; created: number;
+    entries: Array<{ label: string; id: string }>; selected: Set<string> };
+  const scopedMenus = new Map<string, ScopedMenu>();
   const handledInteractions = new Map<string, number>();
   const FORK_PAGE_SIZE = 22;
   const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -300,6 +308,34 @@ export default function (pi: ExtensionAPI) {
       components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
         new StringSelectMenuBuilder().setCustomId(`pi-choice:${token}`).setPlaceholder(`Select ${menu.kind}`).addOptions(options),
       )],
+    };
+  }
+
+  async function resolveConfiguredModels(models: any[], patterns: string[] | undefined): Promise<any[]> {
+    if (!patterns?.length) return models;
+    // Keep /model and /scoped-models consistent with Pi's wildcard/model pattern rules.
+    const { resolveModelScopeFromModels } = await import(pathToFileURL(
+      join(getPackageDir(), "dist", "core", "model-resolver.js")).href);
+    return resolveModelScopeFromModels(patterns, models).scopedModels.map((entry: any) => entry.model);
+  }
+
+  function scopedMenuView(menu: ScopedMenu, token: string, error?: string) {
+    const pages = Math.ceil(menu.entries.length / FORK_PAGE_SIZE);
+    const options = menu.entries.slice(menu.page * FORK_PAGE_SIZE, (menu.page + 1) * FORK_PAGE_SIZE)
+      .map(entry => ({ label: `${menu.selected.has(entry.id) ? "✅" : "⬜"} ${entry.label}`.slice(0, 100),
+        value: entry.id, description: entry.id.slice(0, 100) }));
+    if (menu.page > 0) options.push({ label: "⬅️ Previous page", value: "__prev__", description: "Previous models" });
+    if (menu.page + 1 < pages) options.push({ label: "➡️ Next page", value: "__next__", description: "More models" });
+    return {
+      content: `${error ? `❌ ${error}\n` : ""}Select a model to toggle it (page ${menu.page + 1}/${pages}; ${menu.selected.size}/${menu.entries.length} selected). Save applies to new Pi sessions. Reset selects all.`,
+      components: [
+        new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+          new StringSelectMenuBuilder().setCustomId(`pi-scope:${token}`).setPlaceholder("Toggle a model or change page").addOptions(options)),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId(`pi-scope-save:${token}`).setLabel("Save").setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`pi-scope-reset:${token}`).setLabel("Reset to all").setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId(`pi-scope-cancel:${token}`).setLabel("Cancel").setStyle(ButtonStyle.Danger)),
+      ],
     };
   }
 
@@ -925,6 +961,61 @@ export default function (pi: ExtensionAPI) {
         for (const [id, time] of handledInteractions) if (now - time > 15 * 60_000) handledInteractions.delete(id);
         handledInteractions.set(interaction.id, now);
       }
+      const scopeMatch = /^(pi-scope|pi-scope-save|pi-scope-reset|pi-scope-cancel):(.+)$/.exec(interaction.customId ?? "");
+      if (scopeMatch && (interaction.isStringSelectMenu?.() || interaction.isButton?.())) {
+        const [, action, token] = scopeMatch;
+        const menu = scopedMenus.get(token);
+        if (!menu) return;
+        if (interaction.user.id !== menu.userId || interaction.channelId !== menu.channelId ||
+          (activeConfig?.allowedUserIds?.length && !activeConfig.allowedUserIds.includes(interaction.user.id))) {
+          await interaction.reply({ content: "This menu is unavailable to you.", ephemeral: true });
+          return;
+        }
+        if (Date.now() - menu.created > 10 * 60_000 || menu.sessionId !== activeSessionManager?.getSessionId()) {
+          scopedMenus.delete(token);
+          await interaction.update({ content: "This menu has expired. Run /scoped-models again.", components: [] });
+          return;
+        }
+        if (action === "pi-scope") {
+          const value = interaction.values?.[0];
+          const pages = Math.ceil(menu.entries.length / FORK_PAGE_SIZE);
+          if (value === "__prev__") menu.page = Math.max(0, menu.page - 1);
+          else if (value === "__next__") menu.page = Math.min(pages - 1, menu.page + 1);
+          else if (menu.entries.slice(menu.page * FORK_PAGE_SIZE, (menu.page + 1) * FORK_PAGE_SIZE)
+            .some(entry => entry.id === value)) {
+            if (menu.selected.has(value)) menu.selected.delete(value);
+            else menu.selected.add(value);
+          } else return;
+          await interaction.update(scopedMenuView(menu, token));
+          return;
+        }
+        if (action === "pi-scope-cancel") {
+          scopedMenus.delete(token);
+          await interaction.update({ content: "Model selection cancelled.", components: [] });
+          return;
+        }
+        if (action === "pi-scope-reset") {
+          menu.selected = new Set(menu.entries.map(entry => entry.id));
+          await interaction.update(scopedMenuView(menu, token));
+          return;
+        }
+        if (!menu.selected.size) {
+          await interaction.update(scopedMenuView(menu, token, "Select at least one model, or reset to all."));
+          return;
+        }
+        await interaction.deferUpdate();
+        try {
+          const settings = SettingsManager.create(activeCwd);
+          settings.setEnabledModels(menu.selected.size === menu.entries.length ? undefined :
+            menu.entries.filter(entry => menu.selected.has(entry.id)).map(entry => entry.id));
+          await settings.flush();
+          scopedMenus.delete(token);
+          await interaction.editReply({ content: "Cycling models saved. Changes apply to new Pi sessions; the current session keeps its existing scope.", components: [] });
+        } catch (error) {
+          await interaction.editReply(scopedMenuView(menu, token, `Save failed: ${String(error)}`));
+        }
+        return;
+      }
       if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith("pi-choice:")) {
         const token = interaction.customId.slice("pi-choice:".length);
         const menu = choiceMenus.get(token);
@@ -954,6 +1045,20 @@ export default function (pi: ExtensionAPI) {
           if (agentBusy || !selected) {
             await interaction.reply({ content: "Pi is busy or that option is unavailable. Try again when idle.", ephemeral: true });
             return;
+          }
+          if (menu.kind === "model") {
+            try {
+              const allowed = await resolveConfiguredModels(activeModelRegistry?.getAvailable?.() ?? [],
+                SettingsManager.create(activeCwd).getEnabledModels());
+              if (!allowed.some((model: any) => `${model.provider}/${model.id}` === selected.value)) {
+                choiceMenus.delete(token);
+                await interaction.update({ content: "Model scope changed. Run /model again.", components: [] });
+                return;
+              }
+            } catch (error) {
+              await interaction.reply({ content: `Could not check model scope: ${String(error)}`, ephemeral: true });
+              return;
+            }
           }
           choiceMenus.delete(token);
           await interaction.update({ content: menu.kind === "resume" ? `Resuming ${selected.label}…` : `Setting ${menu.kind} to ${selected.label}…`, components: [] });
@@ -1054,6 +1159,27 @@ export default function (pi: ExtensionAPI) {
           await interaction.reply({ content: "⏳ Pi is processing. Only /abort can run right now.", ephemeral: true });
           return;
         }
+        if (coreCommand === "scoped-models") {
+          await interaction.deferReply({ ephemeral: true });
+          try {
+            const models: any[] = activeModelRegistry?.getAvailable?.() ?? [];
+            if (!models.length) throw new Error("No available models found.");
+            const entries = models.map(model => ({ label: `${model.name} (${model.provider}/${model.id})`,
+              id: `${model.provider}/${model.id}` }));
+            const configured = SettingsManager.create(activeCwd).getEnabledModels();
+            const selected: Set<string> = new Set((await resolveConfiguredModels(models, configured))
+              .map((model: any) => `${model.provider}/${model.id}`));
+            for (const [key, menu] of scopedMenus) if (Date.now() - menu.created > 10 * 60_000) scopedMenus.delete(key);
+            const token = randomUUID();
+            const menu: ScopedMenu = { userId: interaction.user.id, channelId: interaction.channelId,
+              sessionId: activeSessionManager.getSessionId(), entries, selected, page: 0, created: Date.now() };
+            scopedMenus.set(token, menu);
+            await interaction.editReply(scopedMenuView(menu, token));
+          } catch (error) {
+            await interaction.editReply(`Scoped models failed: ${String(error)}`);
+          }
+          return;
+        }
         if (coreCommand === "resume") {
           await interaction.deferReply({ ephemeral: true });
           const sessions = await SessionManager.list(activeCwd, activeSessionManager.getSessionDir());
@@ -1075,13 +1201,20 @@ export default function (pi: ExtensionAPI) {
         if (coreCommand === "model" || coreCommand === "thinking") {
           // Acknowledge before looking up models to meet Discord's interaction deadline.
           await interaction.deferReply({ ephemeral: true });
-          const entries = coreCommand === "model"
-            ? (activeModelRegistry?.getAvailable?.() ?? []).map((model: any) => ({
-              label: `${model.name} (${model.provider}/${model.id})`, value: `${model.provider}/${model.id}`,
-            }))
-            : THINKING_LEVELS.map(level => ({ label: level, value: level }));
+          let entries: Array<{ label: string; value: string }>;
+          try {
+            const models: any[] = activeModelRegistry?.getAvailable?.() ?? [];
+            entries = coreCommand === "model"
+              ? (await resolveConfiguredModels(models, SettingsManager.create(activeCwd).getEnabledModels()))
+                .map((model: any) => ({ label: `${model.name} (${model.provider}/${model.id})`,
+                  value: `${model.provider}/${model.id}` }))
+              : THINKING_LEVELS.map(level => ({ label: level, value: level }));
+          } catch (error) {
+            await interaction.editReply({ content: `Could not load model scope: ${String(error)}` });
+            return;
+          }
           if (!entries.length) {
-            await interaction.editReply({ content: "No available models found." });
+            await interaction.editReply({ content: "No models match the saved scope. Use /scoped-models to change it." });
             return;
           }
           for (const [key, menu] of choiceMenus) if (Date.now() - menu.created > 10 * 60_000) choiceMenus.delete(key);
@@ -1455,6 +1588,7 @@ export default function (pi: ExtensionAPI) {
               const command = new SlashCommandBuilder().setName(name).setDescription(description);
               if (name === "name") command.addStringOption(o => o.setName("name").setDescription("New session name").setRequired(true));
               if (name === "tree") command.addStringOption(o => o.setName("entry").setDescription("Session entry ID").setRequired(true));
+
               return command.toJSON();
             }),
             new SlashCommandBuilder().setName("rc").setDescription("Control the Pi remote session")
@@ -1902,6 +2036,29 @@ export default function (pi: ExtensionAPI) {
             pi.setSessionName(args);
             result = `✅ Session name set to ${args}.`;
             break;
+          case "export": {
+            const sessionFile = ctx.sessionManager.getSessionFile();
+            if (!sessionFile || !existsSync(sessionFile)) throw new Error("Nothing to export yet; start a conversation first.");
+            // Pi does not expose session.exportToHtml through ExtensionCommandContext.
+            // Use the same HTML exporter as the terminal /export implementation.
+            const exporterPath = join(getPackageDir(), "dist", "core", "export-html", "index.js");
+            const { exportSessionToHtml } = await import(pathToFileURL(exporterPath).href);
+            const outputPath = join(ctx.cwd, `pi-session-${basename(sessionFile, ".jsonl")}.html`);
+            const settings = SettingsManager.create(ctx.cwd);
+            const filePath: string = await exportSessionToHtml(ctx.sessionManager, {
+              systemPrompt: ctx.getSystemPrompt(),
+              tools: pi.getAllTools().filter(tool => pi.getActiveTools().includes(tool.name)),
+            }, { outputPath, themeName: settings.getTheme() });
+            const uploaded = await sendAttachmentToActiveChannel({
+              channelId: replyChannelId ?? undefined, path: filePath,
+              filename: basename(filePath), mediaType: "text/html",
+              caption: "Session HTML export. This file may contain private prompts, tool output, or credentials.",
+            });
+            result = uploaded.ok
+              ? `✅ Saved to ${filePath} and uploaded the same file to Discord.`
+              : `⚠️ Saved to ${filePath}, but Discord upload failed: ${uploaded.error}`;
+            break;
+          }
           case "session": {
             const manager = ctx.sessionManager;
             const model = ctx.model;
