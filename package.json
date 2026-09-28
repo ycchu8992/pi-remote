@@ -1,8 +1,8 @@
 {
-  "name": "pi-discord-remote",
+  "name": "pi-remote",
   "version": "0.2.4",
   "type": "module",
-  "description": "Control your Pi coding-agent session from Discord — each session gets its own auto-created channel",
+  "description": "Control Pi coding-agent sessions from Discord with per-session connections and channels",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -12,9 +12,9 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ycchu8992/pi-discord-remote.git"
+    "url": "git+https://github.com/ycchu8992/pi-remote.git"
   },
-  "homepage": "https://github.com/ycchu8992/pi-discord-remote#readme",
+  "homepage": "https://github.com/ycchu8992/pi-remote#readme",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [

@@ -9,8 +9,8 @@ A **session** is a Pi agent session; a **channel** is a Discord text channel (fo
 The npm package is not published yet. For now, install from the source repository. Requires [Pi](https://pi.dev) 0.87.1 (command dispatch and replacement-context APIs), Git, and Node.js 22.19 or newer:
 
 ```bash
-git clone https://github.com/ycchu8992/pi-discord-remote.git
-cd pi-discord-remote
+git clone https://github.com/ycchu8992/pi-remote.git
+cd pi-remote
 npm ci
 npm run build
 pi install "$PWD"
