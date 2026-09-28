@@ -125,6 +125,28 @@ Questions and custom-answer modals have unique per-question IDs; stale/foreign c
 
 When Discord **is not** connected, the original `ask_user_question` (TUI dialog) works normally as a fallback. No need to uninstall `@juicesharp/rpiv-ask-user-question` — the two extensions coexist gracefully.
 
+## LLM context cost and agent awareness
+
+The figures below estimate **input context**, not memory or Discord API usage. They are **rough tok estimates**, not measured token counts: model/provider tokenizers and tool serialization differ. In the current code, the two registered model-facing tool definitions (name, description, parameters) total **1,262 ASCII characters**; when connected, `before_agent_start` also adds **392 ASCII characters** to the system prompt for a 19-digit channel ID. The estimates assume both tools remain active and no other extension changes the active tool set.
+
+| State of this extension | Additional per-session conversation history while unused | Additional input per model prompt/turn |
+|---|---|---|
+| Installed/loaded, never `/rc enable` | **0 tok** of additional user/assistant conversation messages; the two tool definitions are available to the model | Approximately **300–600 tok** for the two tool definitions; **0 tok** of Discord connection hint |
+| `/rc enable`, not `/rc connect` | **0 tok** of additional conversation messages from allocation; the registry entry is on disk, outside model context | Approximately **300–600 tok**, the same as loaded-but-unused; allocation alone adds no prompt text |
+| `/rc connect` (for comparison) | No *per-turn accumulating* connection message while idle; the active channel ID is supplied in the request prompt | Approximately **400–750 tok**: the tools above plus roughly **90–150 tok** of connection-specific system-prompt text |
+| `/rc disable` after connecting | Disabling itself adds **0 tok** of conversation messages and does not erase earlier session history | Future requests return to approximately **300–600 tok** for the still-registered tools; the connection hint stops. Earlier user messages/tool results, if any, remain in the session |
+
+The per-prompt column is the approximate **context occupancy on each model request**, not a fresh charge to be added cumulatively to the session transcript on every turn. A model turn can make multiple provider requests, and prompt caching may change billed input without removing these definitions from the logical request. The installed tools are registered regardless of `/rc enable`, `/rc connect`, or `/rc disable`; those commands do **not** unload the extension. Exact tok deltas require comparing actual provider requests for the same model and conversation with and without this extension.
+
+**Reply/forwarding costs are separate from the table:** forwarding the agent's output, thinking notice and tool-status messages *to Discord* does not itself add model input. A Discord prompt becomes a normal user message (as terminal input would); replying to a Discord message can prepend up to 3,000 characters of quoted context, and incoming images, attachment paths, steering prompts, question answers and tool results can add variable context if used. These are usage-dependent, not fixed costs of merely loading or enabling the extension.
+
+What the agent additionally knows or can do:
+
+- It sees the names, descriptions and parameter schemas for `discord_ask_user_question` and `discord_send_file`, including that they can ask questions through Discord and send a file to the active channel. These tools remain registered even when disconnected, although using them then fails or returns a no-UI result.
+- **Only while connected**, it receives the active Discord channel ID and instructions to prefer the Discord question tool over the terminal-only question tool; the extension also blocks calls to the terminal-only `ask_user_question` during connection.
+- When a user replies to a Discord message, the quoted author's name and text may be included in that *specific* user prompt. Non-image attachments can be represented by local file paths; these are not injected on unrelated turns.
+- It does **not** automatically learn the bot token, the connection registry, all channels, or other sessions merely because the extension is loaded.
+
 ## License
 
 MIT
