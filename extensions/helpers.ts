@@ -28,6 +28,12 @@ export function sessionLabel(name: string | undefined, firstMessage: string | un
   return title.slice(0, 100 - suffix.length) + suffix;
 }
 
+export function sessionChannelName(label: string, thread: boolean): string {
+  if (thread) return label.slice(0, 100);
+  return label.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}_-]+/gu, "-")
+    .replace(/-+/g, "-").replace(/^-|-$/g, "").slice(0, 100) || "unnamed-session";
+}
+
 /** Count how many unmatched ``` fences precede a position in the text. */
 function countOpenFences(text: string): number {
   let count = 0;

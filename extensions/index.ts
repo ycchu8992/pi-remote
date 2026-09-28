@@ -48,6 +48,7 @@ import type { Config } from "./config.js";
 import {
   makeChannelName,
   sessionLabel,
+  sessionChannelName,
   splitMessage,
   toolLabel,
   isAbortLikeError,
@@ -105,6 +106,38 @@ export default function (pi: ExtensionAPI) {
   let activeSessionManager: any = null;
   let activeCwd = "";
   let resumeTarget: { id: string; path: string } | undefined;
+  let renameRunning = false;
+  let renamePending = false;
+
+  function currentSessionLabel(): string {
+    const first = activeSessionManager?.getEntries().find((entry: any) => entry.type === "message" && entry.message?.role === "user")?.message.content;
+    const text = typeof first === "string" ? first : first?.filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
+    return sessionLabel(activeSessionManager?.getSessionName?.(), text, currentSessionId!);
+  }
+
+  async function syncChannelName(): Promise<void> {
+    if (renameRunning) { renamePending = true; return; }
+    if (remotelyPaused || transitionPending || !client?.isReady() || !runtime.activeChannelId) return;
+    renameRunning = true;
+    const target = client;
+    const channelId = runtime.activeChannelId;
+    try {
+      if (!await maintainConnection()) return;
+      const channel = await withTimeout(target.channels.fetch(channelId), 10_000, "fetch_channel_for_name");
+      if (!channel || !("setName" in channel) || client !== target || remotelyPaused || transitionPending) return;
+      const name = sessionChannelName(currentSessionLabel(), channel.isThread());
+      if (channel.name !== name) await withTimeout<unknown>(channel.setName(name, "Sync Pi session display name"), 10_000, "sync_channel_name");
+      if (client === target && runtime.activeChannelId === channelId) {
+        runtime.sessionChannelName = name;
+        connectSetStatus?.("pi-remote", `🔌 Discord: #${name}`);
+      }
+    } catch (error) {
+      connectNotify?.(`Connected, but could not sync channel name: ${String(error)}`, "warning");
+    } finally {
+      renameRunning = false;
+      if (renamePending) { renamePending = false; void syncChannelName(); }
+    }
+  }
   let currentSessionId: string | null = null;
   let pendingNextChannelId: string | null = null;
   const connections = new ConnectionStore();
@@ -733,6 +766,7 @@ export default function (pi: ExtensionAPI) {
     pendingReplyUserId = null;
     } finally {
       agentBusy = false;
+      await syncChannelName();
       await maintainConnection();
     }
   });
@@ -1194,6 +1228,8 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  pi.on("session_info_changed", async () => { await syncChannelName(); });
+
   pi.on("session_before_switch", async (event: any, ctx: any) => {
     try {
       if (event.reason === "new") return await prepareReplacement(ctx);
@@ -1387,8 +1423,8 @@ export default function (pi: ExtensionAPI) {
       const onReady = async (c: Client) => {
         clearTimeout(timeout);
         cancelInitialReady = () => {};
-        // Channel creation happens inside this single ready handler
-        const channelName = makeChannelName(cwd);
+        // New destinations use the same label as the resume picker.
+        const channelName = sessionChannelName(currentSessionLabel(), false);
         try {
           const guild = await c.guilds.fetch(cfg.guildId);
           if (client !== c || isShuttingDown) throw new Error("Connection attempt cancelled");
@@ -1437,6 +1473,7 @@ export default function (pi: ExtensionAPI) {
           const label = `🔌 Discord: #${newChannel.name}`;
           notifyFn(`Connected as ${c.user!.tag} → #${newChannel.name}`, "success");
           setStatusFn("pi-remote", label);
+          await syncChannelName();
         } catch (err) {
           reject(err);
           return;
