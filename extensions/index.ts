@@ -1791,6 +1791,8 @@ export default function (pi: ExtensionAPI) {
   // When Discord is connected, use this tool instead of ask_user_question.
   pi.registerTool({
     name: "discord_ask_user_question",
+    // Interactive tools must stay out of codemode and ctx.executeTool().
+    exposure: "model-only",
     executionMode: "sequential",
     label: "Ask User Question (Discord)",
     description:

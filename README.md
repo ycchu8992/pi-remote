@@ -6,17 +6,21 @@ A **session** is a Pi agent session; a **channel** is a Discord text channel (fo
 
 ## Install
 
-The npm package is not published yet. For now, install from the source repository. Requires [Pi](https://pi.dev) 0.87.1 (command dispatch and replacement-context APIs), Git, and Node.js 22.19 or newer:
+The npm package is not published yet. For now, install from the source repository. Requires [Pi](https://pi.dev) 0.99.1 or newer within the 0.99.x series, Git, and Node.js 22.19 or newer:
 
 ```bash
 git clone https://github.com/ycchu8992/pi-remote.git
 cd pi-remote
 npm ci
-npm run build
+npm run verify
 pi install "$PWD"
 ```
 
-Restart Pi to load the extension, then run `/rc setup` in Pi to configure your Discord bot. See [Bot setup](#bot-setup) for the required Discord permissions and [Usage](#usage) for commands. To update later, pull the latest source, rerun `npm ci && npm run build`, and restart Pi.
+Source installs pin `undici` to 8.10.2 and `ws` to 8.21.0 through npm overrides, matching Pi 0.99.1. `npm run verify` checks types, tests (including dependency alignment), builds the extension, and runs a full security audit. It fails if those checks detect a problem. Overrides apply when this repository is the installation root (`npm ci` above); npm does not apply a dependency package's overrides when it is installed inside another project.
+
+Pi 0.99.x codemode can call `discord_send_file`; `discord_ask_user_question` is model-only so interactive questions cannot be invoked from codemode scripts or nested tool calls.
+
+Restart Pi to load the extension, then run `/rc setup` in Pi to configure your Discord bot. See [Bot setup](#bot-setup) for the required Discord permissions and [Usage](#usage) for commands. To update later, pull the latest source, rerun `npm ci && npm run verify`, and restart Pi.
 
 ## Bot setup
 
